@@ -52,7 +52,7 @@ class MyBatcher:
     def OneSSsampler(self):
         if self.index==0:
             self.datasource=self.data[torch.argsort(torch.rand(size=(self.n_paths,self.length)), dim=-1)]
-        k_=np.random.randint(self.n_paths,self.length)
+        k_=np.random.randint(low=0,high=self.length)
         self.index=(self.index+1)%self.K 
         inds=np.arange(k_,k_+self.bs)%self.length
         data=self.datasource[:,inds]
@@ -118,9 +118,12 @@ class HMCIntegrators:
             integ=self.PSGLD if pcond else self.SGLD
         else:
             integ=self.PLD if pcond else self.LD
+        #Burnin
+        for n in range(0,1000):
+            q=integ(q,hmed)
+            
         for n in range(0,Nsamples):
-            h=hmed
-            q=integ(q,h)
+            q=integ(q,hmed)
             # log_posts[n] = self.log_posterior(q)
             samples[n]=q
         return samples,None #log_posts
@@ -287,7 +290,7 @@ N=2**10
 K=2**5
 bs=N//K
 d=1
-n_paths=1000
+n_paths=10000
 x=torch.randn((N,d,1)).squeeze(-1) #number of examples, number of features, 1
 Exp1=GaussianExp(x, bs,n_paths=n_paths)
 
@@ -300,7 +303,7 @@ with open("Gaussian1D_truemeancov.pkl", 'rb') as f:
     truecov=d['truecov']
     truemean=d['truemean']
 
-etarange = 2.**torch.arange(-2,6,1)/K
+etarange = (2.**torch.arange(-2,6,1)*1.1)/K
 Nsamples=((100 +(20/(etarange*K)**3))*K).to(torch.int32)
 truecov,truemean=Exp1.truecov,Exp1.truemean
 strats=['RR','1SS','FULLGRAD']
@@ -339,14 +342,15 @@ for strat in strats:
         cov_SGLD=(c1-musq[None,...])[-10*K:] #shape (n_iters,n_paths,n_features)
         e1=torch.linalg.norm(((cov_SGLD-truecov)/truecov).flatten(start_dim=1,end_dim=-1),dim=-1)
         h=samples['h']
-        #Plot oscillations
-        if strat=='RR':
-            plt.figure()
-            num=round(np.log2(h.item()*K),1)
-            
-            plt.semilogy(np.arange(len(e1))/K,
-                                  torch.abs(e1),'k',ls='--' ,
-                                  label='$hK=2^{'+f'{num}'+'}$',base=2)
+        # Plot oscillations
+   
+        plt.figure()
+        plt.title(strat)
+        num=round(np.log2(h.item()*K),1)
+        
+        plt.semilogy(np.arange(len(e1))/K,
+                              torch.abs(e1),'k',ls='--' ,
+                              label='$hK=2^{'+f'{num}'+'}$',base=2)
        
 plt.figure(RRplot)
 fig2title=f'Relative Variance Error, Asymptotic, RR $K={K}$'
@@ -437,14 +441,13 @@ for strat in strats:
         e1=torch.linalg.norm(((cov_SGLD-truecov)/truecov).flatten(start_dim=1,end_dim=-1),dim=-1)
         h=samples['h']
         #Plot oscillations
-        if strat=='RR':
-            plt.figure()
-            num=round(np.log2(h.item()*K),1)
-            
-            plt.semilogy(np.arange(len(e1))/K,
-                                  torch.abs(e1),'k',ls='--' ,
-                                  label='$hK=2^{'+f'{num}'+'}$',base=2)
-       
+        plt.figure()
+        num=round(np.log2(h.item()*K),1)
+        
+        plt.semilogy(np.arange(len(e1))/K,
+                              torch.abs(e1),'k',ls='--' ,
+                              label='$hK=2^{'+f'{num}'+'}$',base=2)
+   
 plt.figure(RRplot)
 fig2title=f'Relative Variance Error, Asymptotic, RR $K={K}$'
 plt.title(fig2title)
@@ -547,7 +550,7 @@ RRplot=plt.figure()
 for strat in strats:
     loc=sgld_dict[strat]
     for i,timestep in enumerate(loc.keys()):
-        stoch =False if strat=='FULLGRAD' else True
+        stoch=False if strat=='FULLGRAD' else True
         samples=loc[timestep]
         s=samples['samples']
         e=(s.mean(dim=0)-truemean).mean(dim=0) #shape (n_paths,n_features)
@@ -555,13 +558,12 @@ for strat in strats:
         e1=torch.linalg.norm(e1/truemean,dim=1) #shape (n_iters,n_features)
         h=samples['h']
         #Plot oscillations
-        if strat=='RR':
-            plt.figure()
-            num=round(np.log2(h.item()*K),1)
-            
-            plt.semilogy(np.arange(len(e1[-10*K:]))/K,
-                                  torch.abs(e1[-10*K:]),'k',ls='--' ,
-                                  label='$hK=2^{'+f'{num}'+'}$',base=2)
+        plt.figure()
+        num=round(np.log2(h.item()*K),1)
+        
+        plt.semilogy(np.arange(len(e1[-10*K:]))/K,
+                              torch.abs(e1[-10*K:]),'k',ls='--' ,
+                              label='$hK=2^{'+f'{num}'+'}$',base=2)
        
         err[strat]+=[torch.linalg.norm(e)/torch.linalg.norm(truemean)]
 plt.figure(RRplot)
@@ -741,14 +743,13 @@ for strat in sgld_dict.keys():
         e1=torch.linalg.norm(e1,dim=1)/torch.linalg.norm(truemean) #shape (n_iters,n_features)
         h=samples['h']
         #Plot oscillations
-        if strat=='RR':
-            plt.figure()
-            num=round(np.log2(h.item()*K),1)
-            plotter=e1[-10*K:,0]
-            plt.semilogy(np.arange(len(plotter))/K,
-                                  torch.abs(plotter),'k',ls='--' ,
-                                  label='$hK=2^{'+f'{num}'+'}$',base=2)
-       
+        plt.figure()
+        num=round(np.log2(h.item()*K),1)
+        plotter=e1[-10*K:,0]
+        plt.semilogy(np.arange(len(plotter))/K,
+                              torch.abs(plotter),'k',ls='--' ,
+                              label='$hK=2^{'+f'{num}'+'}$',base=2)
+   
         err[strat]+=[torch.linalg.norm(e)/torch.linalg.norm(truemean)]
 plt.figure(RRplot)
 fig2title=f'Relative Variance Error, Asymptotic, RR $K={K}$'
