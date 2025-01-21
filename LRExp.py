@@ -4,7 +4,7 @@ import torch
 from sklearn.preprocessing import StandardScaler,PolynomialFeatures
 from torch import cholesky_solve as cho_solve
 from torch.linalg import solve_triangular, cholesky
-
+import os
 from scipy.optimize import fsolve,minimize
 from torch import sigmoid as expit
 from scipy.special import expit as npexpit
@@ -286,14 +286,13 @@ def getLD(Exp1,h, Nsamples,strat='RR',pcond=True,stoch=True):
 
 #%% Gaussian 1D: Sim Data
 torch.manual_seed(2024)
-N=2**10
-K=2**5
+K=2**3
+N=20*K
 bs=N//K
 d=1
 n_paths=10000
 x=torch.randn((N,d,1)).squeeze(-1) #number of examples, number of features, 1
 Exp1=GaussianExp(x, bs,n_paths=n_paths)
-
 
 with open("Gaussian1D_truemeancov.pkl", 'wb') as f:
     pickle.dump({'truemean':Exp1.truemean,'truecov':Exp1.truecov},f)
@@ -303,11 +302,10 @@ with open("Gaussian1D_truemeancov.pkl", 'rb') as f:
     truecov=d['truecov']
     truemean=d['truemean']
 
-etarange = (2.**torch.arange(-2,6,1)*1.1)/K
+etarange = (2.**torch.arange(-3,1,1)*1.1)/K
 Nsamples=((100 +(20/(etarange*K)**3))*K).to(torch.int32)
 truecov,truemean=Exp1.truecov,Exp1.truemean
-strats=['RR','1SS','FULLGRAD']
-err={s:[] for s in strats}
+strats=['RR','1SS']
 sgld_dict={s:{} for s in strats}
 sgld_dict['K']=K
 sgld_dict['etarange']=etarange
@@ -316,7 +314,15 @@ for strat in strats:
         stoch =False if strat=='FULLGRAD' else True
         samples=getLD(Exp1,timestep,Nsamples[i],strat=strat,pcond=True,stoch=stoch) 
         sgld_dict[strat][str(timestep.item())]=samples
-        
+
+Exp1=GaussianExp(x, bs,n_paths=1000)
+strat='FULLGRAD'
+sgld_dict[strat]={}
+for i,timestep in enumerate(etarange):
+    stoch =False if strat=='FULLGRAD' else True
+    samples=getLD(Exp1,timestep,Nsamples[i],strat=strat,pcond=True,stoch=stoch) 
+    sgld_dict[strat][str(timestep.item())]=samples
+
 exp1_file = open(f"Gaussian1DK{K}.pkl", 'wb')
 pickle.dump(sgld_dict,exp1_file)
 exp1_file.close()
@@ -325,6 +331,7 @@ with open(f"Gaussian1DK{K}.pkl", 'rb') as f:
     sgld_dict=pickle.load(f)
 
 ##Plotting
+strats=['RR','1SS','FULLGRAD']
 err={s:[] for s in strats}
 RRplot=plt.figure()
 K=sgld_dict['K']
@@ -343,40 +350,32 @@ for strat in strats:
         e1=torch.linalg.norm(((cov_SGLD-truecov)/truecov).flatten(start_dim=1,end_dim=-1),dim=-1)
         h=samples['h']
         # Plot oscillations
-   
-        plt.figure()
-        plt.title(strat)
-        num=round(np.log2(h.item()*K),1)
-        
-        plt.semilogy(np.arange(len(e1))/K,
-                              torch.abs(e1),'k',ls='--' ,
-                              label='$hK=2^{'+f'{num}'+'}$',base=2)
-       
-plt.figure(RRplot)
-fig2title=f'Relative Variance Error, Asymptotic, RR $K={K}$'
-plt.title(fig2title)
-plt.xlabel('Iteration over dataset')
-plt.legend()
-plt.show()
+        if i==(len(loc.keys())-1):
+            plt.figure(figsize=(3,2))
+            num=round(h.item(),1)
+            stratlab='RM' if strat=='1SS' else strat
+            plt.title('Experimental Variance Error: ' + 'SGLD-'+stratlab+', $h='+f'{num}'+'$')
+            
+            plt.semilogy(np.arange(len(e1))/K,
+                                  torch.abs(e1),'k',ls='-' ,base=2)
+            plt.xlabel('Iteration over dataset')
+            # if strat=='RR':
+                # plt.ylabel('Relative variance error')
+            plt.savefig(os.path.join(figdir,f'Gaussian1DK{K}_Oscillations{strat}.pdf'),format='pdf',bbox_inches='tight')
 
-markerlist=['s','X','o']
-plt.loglog(etarange,err['RR'],'k-',base=2,label='RR',marker=markerlist[0])
-plt.loglog(etarange,err['1SS'],'k-',base=2,label='1SS',marker=markerlist[1])
-plt.loglog(etarange,err['FULLGRAD'],'k-',base=2,label='FULLGRAD',marker=markerlist[2])
-plt.loglog(etarange,etarange,'k--',base=2,alpha=0.7)
-plt.loglog(etarange,(etarange)**2,'k--',base=2,alpha=0.7)
-# plt.loglog(etarange,(etarange)**1.5,'k--',base=2,alpha=0.7)
+# markerlist=['s','X','o']
+markerlist=['','','']
+etarange=sgld_dict['etarange']
+plt.figure(figsize=(3,2))
+plt.loglog(etarange,err['1SS'],'b-',base=2,label='SGLD-RM',marker=markerlist[1])
+plt.loglog(etarange,err['RR'],'r-',base=2,label='SGLD-RR',marker=markerlist[0])
+plt.loglog(etarange,err['FULLGRAD'],'k-',base=2,label='ULA',marker=markerlist[2])
 
-l=len(etarange)
-c=(etarange[1]+etarange[2])/2
-plt.text(c,1.3*c,'$h$')
-plt.text(c,1.3*c**2,'$h^2$')
-# plt.text(c,1.3*c**1.5,'$h^{3/2}$')
-plt.title(f'Gaussian 1D, $K={K}$')
+plt.title(f'Experimental Variance Error, $R={K}$')
 plt.xlabel('$h$')
-plt.ylabel('$\\frac{\|\Delta\Sigma\|}{\|\Sigma\|}$')
+# plt.ylabel('$\|\Delta\Sigma\|/\|\Sigma\|$')
 plt.legend()
-# plt.savefig(os.path.join(figdir,f'Gaussian2DK{K}.pdf',format='pdf',bbox_inches='tight')
+plt.savefig(os.path.join(figdir,f'Gaussian1DK{K}.pdf'),format='pdf',bbox_inches='tight')
 
 # with open("Gaussian2D_truemeancov.pkl", 'wb') as f:
 #     pickle.dump({'truemean':Exp1.truemean,'truecov':Exp1.truecov},f)
@@ -478,22 +477,22 @@ plt.legend()
 #     pickle.dump({'truemean':Exp1.truemean,'truecov':Exp1.truecov},f)
 #%% LogReg Experiment 1: Sim Data
 Nsamples_HMC=10**6
-np.random.seed(2024)
-d=25
-p=d+1
-N=2**10
-scaler=np.hstack((5*np.ones(shape=(1,5)),np.ones(shape=(1,5)),.2*np.ones(shape=(1,d-10))))
-params=np.random.normal(size=(p,))
-x=np.random.normal(size=(N,d),scale=scaler) #input data
-xnew=np.hstack((np.ones(shape=(N,1)),x))
-p_i=expit(torch.tensor(xnew@params))
-y=np.random.binomial(1, p_i).flatten() # output data
-sig_sq=25 #priors
-C=sig_sq
+# np.random.seed(2024)
+# d=25
+# p=d+1
+# N=2**10
+# scaler=np.hstack((5*np.ones(shape=(1,5)),np.ones(shape=(1,5)),.2*np.ones(shape=(1,d-10))))
+# params=np.random.normal(size=(p,))
+# x=np.random.normal(size=(N,d),scale=scaler) #input data
+# xnew=np.hstack((np.ones(shape=(N,1)),x))
+# p_i=expit(torch.tensor(xnew@params))
+# y=np.random.binomial(1, p_i).flatten() # output data
+# sig_sq=25 #priors
+# C=sig_sq
 
-exp1_file = open("SimDataSmall.pkl", 'wb')
-pickle.dump({'x':x,'y':y,'params':params},exp1_file)
-exp1_file.close()
+# exp1_file = open("SimDataSmall.pkl", 'wb')
+# pickle.dump({'x':x,'y':y,'params':params},exp1_file)
+# exp1_file.close()
 
 with open("SimDataSmall.pkl", 'rb') as f:
     d=pickle.load(f)
@@ -501,10 +500,10 @@ with open("SimDataSmall.pkl", 'rb') as f:
     y=torch.tensor(d['y'])
 
 N=len(x)
-K=2**4
+K=2**3
 bs=N//K
 
-Exp1=LogRegExp([x,y],bs,n_paths=1000)
+Exp1=LogRegExp([x,y],bs,n_paths=20)
 
 #HMC to get mean
 # Tp=torch.tensor(torch.pi/2)
@@ -522,77 +521,77 @@ Exp1=LogRegExp([x,y],bs,n_paths=1000)
 with open("LogReg_SimDataSmallHMCtruemean.pkl", 'rb') as f:
     truemean=pickle.load(f).detach()
 
-etarange = 2.**torch.arange(0,6,1)/K
+etarange = 2.**torch.arange(2,9)*1.1/K
 Nsamples=((100 +(20/(etarange*K)**3))*K).to(torch.int32)
+# Nsamples=((100 +(20/(etarange*K)**3))*K).to(torch.int32)
 
-strats=['RR','1SS']
+strats=['RR','1SS','FULLGRAD']
 sgld_dict={s:{} for s in strats}
 sgld_dict['K']=K
 sgld_dict['etarange']=etarange
 for strat in strats:
+    stoch=True
+    if strat=='FULLGRAD':
+        stoch=False
+        Exp1=LogRegExp([x,y],bs,n_paths=20)
     for i,timestep in enumerate(etarange):
-        stoch =False if strat=='FULLGRAD' else True
         samples=getLD(Exp1,timestep,Nsamples[i],strat=strat,pcond=True,stoch=stoch) 
         s=samples['samples']
         sgld_dict[strat][str(timestep.item())]=samples
 
-exp1_file = open(f"LogRegSimSmall_SGLDK{K}.pkl", 'wb')
-pickle.dump(sgld_dict,exp1_file)
-exp1_file.close()
+# exp1_file = open(f"LogRegSimSmall_SGLDK{K}.pkl", 'wb')
+# pickle.dump(sgld_dict,exp1_file)
+# exp1_file.close()
 
 with open(f"LogRegSimSmall_SGLDK{K}.pkl", 'rb') as f:
     sgld_dict=pickle.load(f)
 
 ##Plotting
 err={s:[] for s in strats}
-RRplot=plt.figure()
 # K=sgld_dict['K']
 for strat in strats:
     loc=sgld_dict[strat]
     for i,timestep in enumerate(loc.keys()):
-        stoch=False if strat=='FULLGRAD' else True
         samples=loc[timestep]
         s=samples['samples']
         e=(s.mean(dim=0)-truemean).mean(dim=0) #shape (n_paths,n_features)
-        e1=(s.mean(dim=1)-truemean)
+        e1=(s.mean(dim=1)-truemean)[-10*K:]
         e1=torch.linalg.norm(e1/truemean,dim=1) #shape (n_iters,n_features)
         h=samples['h']
         #Plot oscillations
-        plt.figure()
-        num=round(np.log2(h.item()*K),1)
-        
-        plt.semilogy(np.arange(len(e1[-10*K:]))/K,
-                              torch.abs(e1[-10*K:]),'k',ls='--' ,
-                              label='$hK=2^{'+f'{num}'+'}$',base=2)
-       
+        if i==(len(loc.keys())-2):
+            plt.figure(figsize=(3,2))
+            num=round(h.item(),1)
+            stratlab='RM' if strat=='1SS' else strat
+            plt.title('LogReg SimData: ' + 'SGLD-'+stratlab+', $h='+f'{num}'+'$')
+            
+            plt.semilogy(np.arange(len(e1))/K,
+                                  torch.abs(e1),'k',ls='-' ,base=2)
+            plt.xlabel('Iteration over dataset')
+            plt.ylabel('$\|\Delta\mu/\mu\|$')
+            plt.savefig(os.path.join(figdir,f'LRSimDataK{K}_Oscillations{strat}.pdf'),format='pdf',bbox_inches='tight')
+            if strat=='1SS':
+                plt.yticks([2**.5,2**.75],['$2^{0.5}$','$2^{0.75}$'])
+            else:
+                plt.yticks([2**.25,2**.5],['$2^{0.25}$','$2^{0.5}$'])
         err[strat]+=[torch.linalg.norm(e)/torch.linalg.norm(truemean)]
-plt.figure(RRplot)
-fig2title=f'Relative Variance Error, Asymptotic, RR $K={K}$'
-plt.title(fig2title)
-plt.xlabel('Iteration over dataset')
-plt.legend()
-plt.show()
 
+# markerlist=['s','X','o']
+markerlist=['','','']
 
-markerlist=['s','X','o']
-plt.loglog(etarange,err['RR'],'k-',base=2,label='RR',marker=markerlist[0])
-plt.loglog(etarange,err['1SS'],'k-',base=2,label='1SS',marker=markerlist[1])
-# plt.loglog(etarange,err['FULLGRAD'],'k-',base=2,label='FULLGRAD',marker=markerlist[2])
-plt.loglog(etarange,etarange,'k--',base=2,alpha=0.7)
-plt.loglog(etarange,(etarange)**2,'k--',base=2,alpha=0.7)
-# plt.loglog(etarange,(etarange)**1.5,'k--',base=2,alpha=0.7)
+plt.figure(figsize=(3,2))
+plt.loglog(etarange,err['1SS'],'b-',base=2,label='SGLD-RM',marker=markerlist[1])
+plt.loglog(etarange,err['RR'],'r-',base=2,label='SGLD-RR',marker=markerlist[0])
+plt.loglog(etarange,err['FULLGRAD'],'k-',base=2,label='ULA',marker=markerlist[2])
+# plt.loglog(etarange,etarange,'k--',base=2,alpha=0.7)
+# plt.loglog(etarange,(etarange)**2,'k--',base=2,alpha=0.7)
+# # plt.loglog(etarange,(etarange)**1.5,'k--',base=2,alpha=0.7)
 
-l=len(etarange)
-c=(etarange[1]+etarange[2])/2
-plt.text(c,1.3*c,'$h$')
-plt.text(c,1.3*c**2,'$h^2$')
-# plt.text(c,1.3*c**1.5,'$h^{3/2}$')
-plt.title(f'LogReg_SimDataSmall, $K={K}$')
+plt.title(f'LogReg SimData, $R={K}$')
 plt.xlabel('$h$')
-plt.ylabel('$\\frac{\|\Delta\mu\|}{\|\mu\|}$')
+plt.ylabel('$\|\Delta\mu/\mu\|$')
 plt.legend()
-# plt.savefig(f'LogRegSimDataSmallK{K}.pdf',format='pdf',bbox_inches='tight')
-# plt.show()
+plt.savefig(os.path.join(figdir,f'LogRegSimDataSmallK{K}.pdf'),format='pdf',bbox_inches='tight')
 #%% LogReg Experiment 2: Chess
 Nsamples_HMC=10**8
 np.random.seed(2022)
@@ -607,7 +606,7 @@ K=16
 N=len(x)
 bs=N//K
 
-Exp1=LogRegExp([x,y],bs,n_paths=1000)
+Exp1=LogRegExp([x,y],bs,n_paths=20)
 
 # #HMC to get mean
 # Tp=torch.tensor(torch.pi/2)
@@ -647,9 +646,9 @@ for strat in strats:
         sgld_dict[strat][str(timestep)]=samples
         err[strat]+=[torch.linalg.norm(e)/torch.linalg.norm(truemean)]
 
-exp1_file = open(f"LogRegChess_SGLDK{K}.pkl", 'wb')
-pickle.dump(sgld_dict,exp1_file)
-exp1_file.close()
+# exp1_file = open(f"LogRegChess_SGLDK{K}.pkl", 'wb')
+# pickle.dump(sgld_dict,exp1_file)
+# exp1_file.close()
 
 markerlist=['s','X','o']
 plt.loglog(etarange,err['RR'],'k-',base=2,label='RR',marker=markerlist[0])

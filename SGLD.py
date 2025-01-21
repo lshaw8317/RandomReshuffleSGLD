@@ -54,21 +54,28 @@ def hist_laxis(data, n_bins=100, range_limits=None,bins=None,density=False):
     bw=(bins[1:]-bins[:-1])[None,...]
     return  counts/np.sum(counts,axis=-1,keepdims=True)/bw if density else counts
 
+def covcalc(s):
+    c=(s**2).mean(dim=0)
+    musq=truemean**2
+    cov_SGLD=(c-musq[None,...]).mean(dim=0) #shape (n_paths,n_features)
+    err=torch.linalg.norm(cov_SGLD-truecov)/torch.linalg.norm(truecov)
+    c1=(s**2).mean(dim=1)
+    cov_SGLD=(c1-musq[None,...])[-25*K:] #shape (n_iters,n_paths,n_features)
+    e1=torch.linalg.norm(((cov_SGLD-truecov)/truecov).flatten(start_dim=1,end_dim=-1),dim=-1)
+    return err,e1
+
 device='cpu'
 n=bs=20 #constant batch size to ensure CLT holds roughly for a batch
-K = 4 # number of batches
+K = 8 # number of batches
 N=n*K
-etarange = 2.**np.arange(-5,1,1)/K
-etarange=np.flip(etarange)
+etarange = (2.**torch.arange(-2,4,1))/K
 x = torch.randn(N,dtype=torch.float64,device=device)
-n_paths=10000
-epochs=50+np.int32(20/(etarange*K)**3)
+n_paths=1000
+epochs=1000+np.int32(20/(etarange*K)**3)
 nbins=1000
-# gg1=torch.tensor((np.cos(np.pi/6)+1j*np.sin(np.pi/6))/np.sqrt(3))
-# gg1=torch.ones(1)
-# gammas=torch.tensor([gg1,gg1.conj()],dtype=torch.complex128)
 
 truemean = x.mean().cpu()
+truecov=torch.ones_like(truemean)/N
 zrange = torch.linspace(normal.ppf(0.001), normal.ppf(0.999), nbins)
 truedist = gaussian(zrange, loc=truemean, scale=1/np.sqrt(N))[None,...]
 width=abs((zrange[0]-zrange[1])/2)
@@ -77,18 +84,41 @@ addon=(zrange[-1]+width).reshape((1,))
 bins=torch.cat((bins,addon))
 
 class MyBatcher:
-    def __init__(self,data,bs,n_paths):
-        self.n_paths=n_paths
+    def __init__(self,data,bs,n_paths,strat='1SS'):
         self.data=data
-        self.datasource = self.data.repeat((n_paths,1))
         self.length = len(data)
+        shape=tuple([n_paths]+[1 for i in data.shape])
+        self.datasource = data[None,...].repeat(shape)
         self.bs=bs
-        self.K=self.length //self.bs 
-
-    def RRsampler(self):
-        self.datasource=self.data[torch.argsort(torch.rand((self.n_paths,self.length)), dim=-1)]
-        return None
+        self.K=self.length//self.bs 
+        self.index=0
+        self.n_paths=n_paths
+        self.set_strat(strat)
     
+    def set_strat(self,strat):
+        if strat=='RR':
+            print('RR selected')
+            self.sample=self.RRsampler
+        else:
+            print('1SS selected')
+            self.sample=self.OneSSsampler
+            
+    def RRsampler(self):
+        if self.index==0:
+            self.datasource=self.data[torch.argsort(torch.rand(size=(self.n_paths,self.length)), dim=-1)]
+        k,bs=self.index,self.bs
+        self.index=(self.index+1)%self.K 
+        data=self.datasource[:,k*bs:(k+1)*bs]
+        return data
+
+    def OneSSsampler(self):
+        if self.index==0:
+            self.datasource=self.data[torch.argsort(torch.rand(size=(self.n_paths,self.length)), dim=-1)]
+        k_=np.random.randint(low=0,high=self.length)
+        self.index=(self.index+1)%self.K 
+        inds=np.arange(k_,k_+self.bs)%self.length
+        data=self.datasource[:,inds]
+        return data
 
 mybatcher=MyBatcher(x,n,n_paths)
 bs=mybatcher.bs
@@ -113,7 +143,16 @@ def EM(z,h,noisefactor,data):
     z_ += noise
     return z_
 
-def EMExact(z,h,noisefactor):
+def LM(z,h,noisefactor,data,Rn):
+    term = data.mean(axis=-1,keepdims=True)
+    z_ = (1.-h)*z
+    z_ += h*term
+    zeta=torch.randn_like(z)
+    noise = noisefactor*(zeta+Rn)/2
+    z_ += noise
+    return z_,zeta
+
+def EMFullGrad(z,h,noisefactor):
     term = truemean
     z_ = (1.-h)*z
     z_ += h*term
@@ -122,6 +161,15 @@ def EMExact(z,h,noisefactor):
     z_ += noise
     return z_
 
+def LMFullGrad(z,h,noisefactor,Rn):
+    term = truemean
+    z_ = (1.-h)*z
+    z_ += h*term
+    zeta=torch.randn_like(z)
+    noise = noisefactor*(zeta+Rn)/2
+    z_ += noise
+    return z_,zeta
+
 def Wasserstein1(u, v):
     '''
     Return W1 distance between two densities u,v
@@ -129,162 +177,91 @@ def Wasserstein1(u, v):
     return np.sum(np.abs(np.cumsum(u,axis=-1)/np.sum(u,axis=-1,keepdims=True)-np.cumsum(
         v,axis=-1)/np.sum(v,axis=-1,keepdims=True)),axis=-1)/np.sum(u,axis=-1)
 
-mean_err = []
-var_err=[]
-var_errbar=[]
-W1=[]
-W1vars=[]
+
 z=torch.zeros(size=(n_paths,1))
-z=z.to(dtype=x.dtype).to(device=x.device)
-fig1=plt.figure()
-fig2=plt.figure()
+zlm=z.to(dtype=x.dtype).to(device=x.device).detach()
+zem=zlm.clone().detach()
+
+
+strats=['RR','1SS','FG']
+sgld_dict={'EM':{s:{} for s in strats},'LM':{s:{} for s in strats}}
+sgld_dict['K']=K
+sgld_dict['etarange']=etarange
+
+
 for eta_idx,eta in enumerate(etarange):
     h = torch.tensor([eta],device=x.device)
     expA_=torch.exp(-h)
     noisefactor = torch.sqrt((1-torch.exp(-2*h))/N)
-    verr_prog = torch.zeros((epochs[eta_idx]*K)+1,device=x.device)
-    var_time=torch.zeros((epochs[eta_idx]*K)+1,device=x.device)
-    idx = 0
-    mybatcher.RRsampler()
-    if eta_idx==0: #do a burnin
-        for epoch in range(25):
-            mybatcher.RRsampler()
+    for strat in strats:
+        mybatcher.set_strat(strat)
+        Nsamples=epochs[eta_idx]*K
+        i=0
+        sampleslm=torch.zeros((Nsamples,*z.shape))
+        samplesem=torch.zeros((Nsamples,*z.shape))
+
+        R=torch.randn_like(zlm)
+        for epoch in range(epochs[eta_idx]):
             for k in range(K): 
-                # k_=np.random.randint(mybatcher.length)
-                # inds=np.arange(k_,k_+bs)%mybatcher.length
-                # data=mybatcher.datasource[:,inds]
-                data=(mybatcher.datasource[:,k*bs:(k+1)*bs]).to(x.device)
-                # z = exact(z, expA_, noisefactor, data)
-                z = EM(z, h, np.sqrt(2*h/N),data)
+                #z = exact(z, expA_, noisefactor, data)
+                if strat=='FG':
+                    zem = EMFullGrad(zem, h, np.sqrt(2*h/N))
+                    zlm,R = LMFullGrad(zlm, h, np.sqrt(2*h/N),R)
+                    samplesem[i]=zem
+                    sampleslm[i]=zlm
+                else:
+                    data=mybatcher.sample().to(x.device)
+                    zlm,R = LM(zlm, h, np.sqrt(2*h/N),data,R)
+                    zem = EM(zem, h, np.sqrt(2*h/N),data)
+                    sampleslm[i]=zlm
+                    samplesem[i]=zem
 
-    for epoch in range(epochs[eta_idx]):
-        mybatcher.RRsampler()
-        for k in range(K): 
-            # k_=np.random.randint(mybatcher.length)
-            # inds=np.arange(k_,k_+bs)%mybatcher.length
-            # data=mybatcher.datasource[:,inds]
-            data=(mybatcher.datasource[:,k*bs:(k+1)*bs]).to(x.device)
-            # z = exact(z, expA_, noisefactor, data)
-            z = EM(z, h, np.sqrt(2*h/N),data)
+                i+=1
+        sgld_dict['EM'][strat][str(eta.item())]=samplesem
+        sgld_dict['LM'][strat][str(eta.item())]=sampleslm
 
-            idx+=1
-            var_time[idx]=torch.mean(N*(z**2-truemean**2)-1)
-            verr_prog[idx]=torch.mean((idx-1)*verr_prog[idx-1]+(N*(z**2-truemean**2)-1))/idx
-            # counts_fixedpath += hist_laxis(z.T, bins=bins,density=False) #pathwise sample
-            # counts_fixedtime += hist_laxis(z, bins=bins,density=False) #plot W1 as function of time
-            
-    with open(f'figs/EMvartime_RR_eta{eta}_K{K}.npz','wb') as f:
-        np.save(f,var_time.cpu())
-    with open(f'figs/EMverrprog_RR_eta{eta}_K{K}.npz','wb') as f:
-        np.save(f,verr_prog.cpu())
-        
-    num=round(np.log2(h.item()*K),1)
+##Plotting
+err={'EM':{s:[] for s in strats},'LM':{s:[] for s in strats}}
+K=sgld_dict['K']
+for disc in err.keys():
+    for strat in strats:
+        loc=sgld_dict[disc][strat]
+        es=[]
+        for i,timestep in enumerate(loc.keys()):
+            s=loc[timestep]
+            e,e1=covcalc(s)
+            es+=[e]
+            h=float(timestep)
+            # Plot oscillations
+            if i==(len(loc.keys())-2):
+                plt.figure()
+                num=round(np.log2(h),1)
+                stratlab='RM' if strat=='1SS' else strat
+                plt.title(disc+'-'+stratlab+': Asymptotic Error, $h=2^{'+f'{num}'+'}$')
+                
+                plt.semilogy(np.arange(len(e1))/K,
+                                      torch.abs(e1),'k',ls='-' ,base=2)
+                plt.xlabel('Iteration over dataset')
+                plt.ylabel('$\\frac{\|\Delta\Sigma\|}{\|\Sigma\|}$')
+                # plt.savefig(os.path.join(figdir,f'ExactK{K}_Oscillations{strat}.pdf'),format='pdf',bbox_inches='tight')
+        # print(es)
+        err[disc][strat]=es
+#FG
+markerlist=['s','X','o']
+plt.figure()
+plt.loglog(etarange,err['EM']['RR'],'r-',base=2,label='EM-RR')
+plt.loglog(etarange,err['EM']['1SS'],'g-',base=2,label='EM-RM')
+plt.loglog(etarange,err['EM']['FG'],'b-',base=2,label='EM-FG')
+plt.loglog(etarange,err['LM']['RR'],'r--',base=2,label='LM-RR')
+plt.loglog(etarange,err['LM']['1SS'],'g--',base=2,label='LM-RM')
+plt.loglog(etarange,err['LM']['FG'],'b--',base=2,label='LM-FG')
 
-    plt.figure(fig1)
-    time=np.arange(1,idx+1)[...,None]
-    # errorbar = torch.sqrt(verr_prog.var(axis=-1)/n_paths)#torch.sqrt(3/time)*(1+h*K)/torch.sqrt(1-torch.exp(-h))
-    verr_prog_plot = torch.abs(verr_prog)[1:] #relative variance error
-    plt.semilogy(time.squeeze()/K,
-                 verr_prog_plot, 
-                 label='$hK=2^{'+f'{num}'+'}$',base=2)
-    
-    # plt.fill_between(time.squeeze()/K, verr_prog_plot-errorbar, verr_prog_plot+errorbar,
-    #              color='gray', alpha=0.2)
-    
-
-    plt.figure(fig2)
-    plt.semilogy(np.arange(len(var_time[-50*K:]))/K,
-                  torch.abs(var_time[-50*K:]), 
-                  label='$hK=2^{'+f'{num}'+'}$',base=2)
-    fig2title=f'Relative Variance Error, Asymptotic, $K={K}$'
-    plt.xlim([0,50])
-
-    # W1_path=Wasserstein1(counts_fixedpath,truedist) 
-    var_err += [(verr_prog[-1])] #relative error in variance
-    # var_errbar += [np.sqrt(verr_prog[-1].var())/np.sqrt(n_paths)] #relative error in variance
-    # W1 += [W1_path.mean()]
-    # W1vars+=[np.sqrt(W1_path.var())/np.sqrt(samples.shape[1])]
-
-hrange=etarange*K
-# W1=np.array(W1)
-# W1vars=np.array(W1vars)
-var_err=np.array(var_err)
-var_errbar=np.array(var_errbar)
-
-plt.figure(fig1)
-plt.title(f'Relative Variance Error, $K={K}$')
-plt.xlabel('Iteration over dataset')
+plt.title(f'Model Problem, $K={K}$')
+plt.xlabel('$h$')
+plt.ylabel('Relative Variance Error')
 plt.legend()
-# plt.ylim([np.min(hrange)*K*x.var()/4,np.max(hrange)*K*x.var()])
+# plt.savefig(os.path.join(figdir,f'ExactK{K}.pdf'),format='pdf',bbox_inches='tight')
 
-plt.figure(fig2)
-plt.legend()
-plt.title(fig2title)
-plt.xlabel('Iteration over dataset')
-# plt.ylim([2.**-10,2**-3])
-
-var_errRR=[]
-fig2=plt.figure(figsize=(4,3))
-ls=['-','--',':','-.']
-for idx,eta in enumerate([.125,.0625,.03125,.015625]):
-    num=round(np.log2(eta*K),1)
-    with open(f'figs/EMverrprog_RR_eta{eta}_K{K}.npz','rb') as f:
-        verr_prog=np.load(f)
-    with open(f'figs/EMvartime_RR_eta{eta}_K{K}.npz','rb') as f:
-        var_time=torch.tensor(np.load(f))
-    plt.figure(fig2)
-    if idx<2:
-        plt.semilogy(np.arange(len(var_time[-25*K:]))/K,
-                      torch.abs(var_time[-25*K:]),'k',ls=ls[idx] ,
-                      label='$hK=2^{'+f'{num}'+'}$',base=2)
-    fig2title=f'Relative Variance Error, Asymptotic, 1SS $K={K}$'
-    var_errRR += [verr_prog[-1]] #relative error in variance
-plt.figure(fig2)
-plt.title(fig2title)
-plt.xlabel('Iteration over dataset')
-plt.legend()
-# plt.ylim([2**-8,2**-2])
-# plt.savefig('figs/EM_SGLDExp1SS.pdf',format='pdf')
-
-hrange=etarange*K
-plt.figure(figsize=(4,3))
-# errorbar=var_errbar#np.sqrt(3/len(samples))*np.array(1.+hrange*K)/np.sqrt(1-np.exp(-hrange))
-# plt.loglog(hrange,var_err1SS,'kX-',ms=8,label='1SS')
-plt.loglog(hrange,var_errRR,'ks-',ms=8,label='RR')
-# plt.loglog(hrange,var_errTrueGrad,'kd-',ms=8,label='EM')
-
-# plt.fill_between(hrange, var_err-errorbar, var_err+errorbar,
-#                   color='gray', alpha=0.2)
-plt.title('EM SGLD$'+f'K=8$, Relative Variance Error'+'; RR vs 1SS')
-plt.xlabel('$hK$')
-plt.loglog(hrange,np.max(var_err1SS)*(hrange/np.max(hrange)),'k--',label='ref line $(hK)^1$',base=2)
-plt.loglog(hrange,np.max(var_errRR)*(hrange/np.max(hrange))**2,'k:',label='ref line $(hK)^2$',base=2,lw=3)
-# plt.loglog(hrange,np.max(var_errRR)*(hrange/np.max(hrange))**(3/2),'k.-',label='ref line $(hK)^{3/2}$',base=2,lw=3)
-
-# plt.ylim([2**-4,2**0])
-plt.legend()
-# plt.savefig('figs/EM_SGLDExpBias.pdf',format='pdf')
-
-# plt.figure()
-# plt.loglog(hrange,mean_err)
-# plt.title('$'+f'K={K}$, Mean Error')
-# plt.xlabel('$h=K\\eta$')
-# plt.loglog(hrange,np.max(mean_err)*hrange**2,'k--',label='ref line $h^1$',base=2)
-# # plt.ylim([2**-11,2**-3])
-# plt.legend()
-
-
-
-# plt.figure()
-# plt.loglog(hrange,W1,base=2)
-# plt.loglog(hrange,np.max(W1)*hrange/np.max(hrange),'r--',label='ref line $h^1$',base=2)
-# plt.loglog(hrange,np.max(W1)*(hrange/np.max(hrange))**2,'g--',label='ref line $h^2$',base=2)
-# plt.fill_between(hrange, W1-W1vars, W1+W1vars,
-#                  color='gray', alpha=0.2)
-# plt.title('$'+f'K={K}$, W1 distance')
-# plt.xlabel('$hK$')
-# plt.legend()
-# # plt.ylim([2**-9,2**-2])
 
 
 #%% RR
@@ -296,16 +273,15 @@ system=eDhi*system*eDhj
 
 ##i neq j
 expr12=(1-exp(-h*r))**2/(1-exp(-h))**2-(1-exp(-r*h*2))/(1-exp(-2*h))
-system_ij=sympy.simplify(system.subs({exp(-h*i)*exp(-h*j):expr12.factor()})) 
+system_ij=system.subs({exp(-h*i)*exp(-h*j):expr12})
 
 ##i=j
 expr11=(1-exp(-2*h*r))/(1-exp(-2*h))
 iisubs={exp(-h*i)*exp(-h*j):expr11}
-system_ii=sympy.simplify(system.subs(iisubs)) 
+system_ii=system.subs(iisubs)
 
 system_ii=system_ii.subs({V:Vii})
 system_ij=system_ij.subs({V:Vij}).replace(Vij,-Vii/(K-1))
-system_ij=sympy.simplify(system_ij)
 
 #Case V_b^K sum over n epochs
 epoch_sumij=system_ij.subs({r:K})
@@ -324,8 +300,8 @@ epochsubs={exp(-2*K*h*j):(1)/(1-exp(-2*K*h))}
 exprij=epoch_sumij.subs(epochsubs)
 exprii=epoch_sumii.subs(epochsubs)
 eDh=exp(-r*h)
-es_ij=sympy.simplify(eDh**2*exprij) 
-es_ii=sympy.simplify(eDh**2*exprii) 
+es_ij=eDh**2*exprij
+es_ii=eDh**2*exprii
 
 rem_ij=system_ij
 rem_ii=system_ii
@@ -340,41 +316,41 @@ period_subs={A:(1-exp(-h*K))/(1-exp(-h))/K,
 
 period_expr=expr.factor().expand().collect(exp(h*r))
 period_expr=period_expr.replace(exp(-h*r),A).replace(exp(-2*h*r),B).subs(period_subs)
-period_expr=period_expr.factor()
+period_expr=period_expr.simplify()
 
 Kval=16
 nperiods=10
 plt.figure(figsize=(4,3))
 rrange=np.arange(0,nperiods*Kval,dtype=int)
-hrange=2.**np.arange(-5,3,2)
+hrange=2.**np.arange(-5,3,2)/Kval
 varfunc=sympy.lambdify(args=(h,r), expr=expr.replace(K,Kval))
-ans=varfunc(hrange[...,None]/Kval,rrange[None,...]%Kval)
+ans=varfunc(hrange[...,None],rrange[None,...]%Kval)
 periodfunc=sympy.lambdify(args=(h), expr=period_expr.replace(K,Kval))
-perioderrs=periodfunc(hrange/Kval)
+perioderrs=periodfunc(hrange)
 errs=[]
-ls=['-','--',':','-.']
+ls=2*['-','--',':','-.']
 for idx,row in enumerate(ans):
     # plt.semilogy(rrange/Kval,row,base=2)
     s=perioderrs[idx]
-    line,=plt.semilogy(rrange/Kval,s*np.ones_like(rrange),color='k',base=2,ls=ls[idx],label='$hK=2^{'+f'{round(np.log2(hrange[idx]))}'+'}$',alpha=1)
+    line,=plt.semilogy(rrange/Kval,s*np.ones_like(rrange),color='k',base=2,ls=ls[idx],label='$h=2^{'+f'{round(np.log2(hrange[idx]))}'+'}$',alpha=1)
     plt.semilogy(rrange/Kval,row,base=2,ls=line.get_ls(),alpha=.5,color='k')
 
 # plt.loglog(rrange,varfunc(hrange)[-1]*hrange/2,'k--',label='ref line $h^1$',base=2)
-plt.ylabel('Relative variance error (units of $V_x$)')
+plt.ylabel('Relative variance error')
 plt.xlabel('Iteration over dataset')
-plt.title(f'SGLD RR variance error $K={Kval}$')
+plt.title(f'ED-RR variance error $K={Kval}$')
 plt.legend()
-plt.savefig(os.path.join(figdir,'SGLDRR1.pdf'),format='pdf',bbox_inches='tight')
+# plt.savefig(os.path.join(figdir,'EDRR1.pdf'),format='pdf',bbox_inches='tight')
 
 plt.figure(figsize=(4,3))
 plt.loglog(hrange,perioderrs,'kX-',base=2,ms=10,label=f'Average error over a period')
-scaler=np.min(perioderrs)
-plt.loglog(hrange,scaler*(hrange/np.min(hrange))**2,'k--', label='Ref. line $(hK)^2$',base=2)
-plt.ylabel('Relative variance error (units of $V_x$)')
-plt.xlabel('$hK$')
-plt.title(f'SGLD RR variance error, $K={Kval}$')
+hKrange=hrange*Kval
+plt.loglog(hrange,(hKrange**2)/6,'b--', label='Ref. line $(hK)^2/6$',base=2)
+plt.ylabel('Relative variance error')
+plt.xlabel('$h$')
+plt.title(f'ED-RR variance error, $K={Kval}$')
 plt.legend()
-plt.savefig(os.path.join(figdir,'SGLDRR2.pdf'),format='pdf',bbox_inches='tight')
+# plt.savefig(os.path.join(figdir,'EDRR2.pdf'),format='pdf',bbox_inches='tight')
 
 ##Average over a period, accounting for correlations##
 period_series=(sympy.series(period_expr,h,n=3)).simplify()
@@ -385,8 +361,8 @@ for Kval in 2**np.arange(1,10,2):
     varfunc=sympy.lambdify(h, expr=period_expr.replace(K,Kval))
     plt.loglog(hrange,varfunc(hrange/Kval),base=2,label=f'$K={Kval}$')
     # plt.loglog(rrange,varfunc(hrange)[-1]*hrange/2,'k--',label='ref line $h^1$',base=2)
-plt.ylabel('Relative variance error (units of $V_x$)')
-plt.xlabel('$hK$')
+plt.ylabel('Relative variance error')
+plt.xlabel('$h$')
 plt.title(f'RR variance error')
 plt.legend()
 
@@ -527,16 +503,16 @@ system=eDhi*system*eDhj
 
 ##i neq j
 expr12=(1-(1-h)**r)**2/(h)**2-(1-(1-h)**(2*r))/(1-(1-h)**2)
-system_ij=sympy.simplify(system.subs({eDhi*eDhj:expr12.factor()})) 
+system_ij=system.subs({eDhi*eDhj:expr12})
 
 ##i=j
 expr11=(1-(1-h)**(2*r))/(1-(1-h)**2)
 iisubs={eDhi*eDhj:expr11}
-system_ii=sympy.simplify(system.subs(iisubs)) 
+system_ii=system.subs(iisubs) 
 
 system_ii=system_ii.subs({V:Vii})
 system_ij=system_ij.subs({V:Vij}).replace(Vij,-Vii/(K-1))
-system_ij=sympy.simplify(system_ij)
+# system_ij=sympy.simplify(system_ij)
 
 #Case V_b^K sum over n epochs
 epoch_sumij=system_ij.subs({r:K})
@@ -555,8 +531,8 @@ epochsubs={eDhj**2:(1)/(1-(1-h)**(2*K))}
 exprij=epoch_sumij.subs(epochsubs)
 exprii=epoch_sumii.subs(epochsubs)
 eDh=(1-h)**r
-es_ij=sympy.simplify(eDh**2*exprij) 
-es_ii=sympy.simplify(eDh**2*exprii) 
+es_ij=eDh**2*exprij
+es_ii=eDh**2*exprii
 
 rem_ij=system_ij
 rem_ii=system_ii
@@ -570,18 +546,61 @@ series_r=(sympy.series(expr,h,n=3)).coeff(h**2).simplify()
 period_subs={A:(1-(1-h)**K)/h/K,
              B:(1-(1-h)**(2*K))/(1-(1-h)**2)/K}
 
-period_expr=expr.factor().expand().collect(exp(h*r))
-period_expr=period_expr.replace((1-h)**r,A).replace((1-h)**(2*r),B).subs(period_subs)
+period_expr=expr.replace((1-h)**r,A).replace((1-h)**(2*r),B).subs(period_subs)
 period_expr=period_expr.factor()
 
-##Average over a period, accounting for correlations##
-##h coeff is 0
+# ##Average over a period, accounting for correlations##
+# ##h coeff is 0
 period_series=h**2*(sympy.series(period_expr,h,n=3)).coeff(h**2).simplify()
-#h^2*K(K+1)/6
+# #h^2*K(K+1)/4
 
-#add bias due to EM (normalised for relative variance error)
+# #add bias due to EM (normalised for relative variance error)
 bias=sympy.series((1/(1-h/2)),h,n=3)-1
 period_series+=h*bias.coeff(h)+h**2*bias.coeff(h**2)
+
+expr+=h/(2-h)
+locperiod_expr=period_expr+h/(2-h)
+Kval=8
+nperiods=10
+plt.figure(figsize=(4,3))
+rrange=np.arange(0,nperiods*Kval,dtype=int)
+hrange=2.**np.arange(-5,3,.1)/Kval
+varfunc=sympy.lambdify(args=(h,r), expr=expr.replace(K,Kval))
+ans=varfunc(hrange[...,None],rrange[None,...]%Kval)
+periodfunc=sympy.lambdify(args=(h), expr=locperiod_expr.replace(K,Kval))
+perioderrs=periodfunc(hrange)
+errs=[]
+# ls=['-','--',':','-.']
+# for idx,row in enumerate(ans):
+#     # plt.semilogy(rrange/Kval,row,base=2)
+#     s=perioderrs[idx]
+#     line,=plt.semilogy(rrange/Kval,s*np.ones_like(rrange),color='k',base=2,ls=ls[idx],label='$h=2^{'+f'{round(np.log2(hrange[idx]))}'+'}$',alpha=1)
+#     plt.semilogy(rrange/Kval,row,base=2,ls=line.get_ls(),alpha=.5,color='k')
+
+# # plt.loglog(rrange,varfunc(hrange)[-1]*hrange/2,'k--',label='ref line $h^1$',base=2)
+# plt.ylabel('Relative variance error')
+# plt.xlabel('Iteration over dataset')
+# plt.title(f'Theoretical SGLD-RR, $R={Kval}$')
+# plt.legend()
+# plt.savefig(os.path.join(figdir,'EMRR1.pdf'),format='pdf',bbox_inches='tight')
+
+plt.figure(figsize=(4,3))
+hKrange=hrange*Kval
+rmerror=(hrange+hKrange)/(2-hrange)
+plt.loglog(hrange,rmerror,'b-',base=2,ms=10,label=f'SGLD-RM')
+plt.loglog(hrange,perioderrs,'r-',base=2,ms=10,label=f'SGLD-RR')
+localfunc=sympy.lambdify(args=(h), expr=period_expr.replace(K,Kval))
+plt.loglog(hrange,hrange/(2-hrange),'k-', label='ULA',base=2)
+plt.loglog(hrange,localfunc(hrange),'r--', label='RR SG bias',base=2)
+plt.loglog(hrange,hKrange/(2-hrange),'b--', label='RM SG bias',base=2)
+
+plt.ylabel('Relative variance error')
+plt.xlabel('$h$')
+plt.title(f'Theoretical Variance Error, $R={Kval}$')
+plt.legend()
+plt.savefig(os.path.join(figdir,'EMRR2.pdf'),format='pdf',bbox_inches='tight')
+
+
 #%%For EM, with RR, 1SS or Exact Gradient
 plt.loglog(h*K,(K*h)**2/6+h/2,'kX-',base=2,label='RR',ms=8) #RR
 plt.loglog(h*K,K*h/2+h/2,'ks-',base=2,label='1SS',ms=8) #1SS
