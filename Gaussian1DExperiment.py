@@ -1,4 +1,4 @@
-import LogisticRegressionExperimentsCode
+from LogisticRegressionExperimentsCode import *
 
 #%% Gaussian 1D Model Problem
 torch.manual_seed(2024)
