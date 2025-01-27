@@ -414,7 +414,7 @@ def runLRExp(expname,K,n_paths=10**4):
             pickle.dump(truemean,f)
 
     etarange = 2.**torch.arange(-5,1)
-    Nsamples=torch.tensor(np.maximum(10000+(1000/(etarange.numpy())**2),10**6)).to(torch.int32)
+    Nsamples=torch.tensor(np.minimum(10000+(1000/(etarange.numpy())**2),10**6)).to(torch.int32)
 
     strats=['RR','RM','FULLGRAD']
     sgld_dict={s:{} for s in strats}
