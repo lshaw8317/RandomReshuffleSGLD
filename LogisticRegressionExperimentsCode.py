@@ -86,7 +86,7 @@ class HMCIntegrators:
 
     
     def HMCsample(self,q0,hmed,T,Nsamples):
-        q=q0.detach()
+        q=q0.clone().detach()
         acc=0
         ham=lambda q,v:.5*torch.sum(v*(self.J[None,...]@v))+self.U(q)
         samples=torch.zeros((Nsamples,*q.shape))
@@ -111,7 +111,7 @@ class HMCIntegrators:
         return acc/Nsamples,samples
     
     def LDsample(self,q0,hmed,Nsamples,pcond=False,stoch=True):
-        q=q0.detach()
+        q=q0.clone().detach()
         samples=torch.zeros((Nsamples,*q.shape))
         # log_posts = np.empty(Nsamples)
         if stoch:
