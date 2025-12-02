@@ -1,4 +1,4 @@
-Code for the paper ''Random Reshuffling for Stochastic Gradient Langevin Dynamics'', Luke Shaw and Peter A. Whalley.
+Code for the paper [''Random Reshuffling for Stochastic Gradient Langevin Dynamics''](https://arxiv.org/pdf/2501.16055?), Luke Shaw and Peter A. Whalley.
 
 ``ModelProblemCalculation.py`` contains the symbolic manipulations necessary to derive the expressions in section 4 of the paper, where we show SGLD-RM has variance error of order $h+Rh$, while SGLD-RR has error of order $h+(Rh)^2$. ``Gaussian1DExperiment.py`` generates samples and plots the experimental confirmation of the analytical Gaussian calculations.
 
