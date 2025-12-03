@@ -8,7 +8,6 @@ import os
 from scipy.optimize import fsolve,minimize
 from torch import sigmoid as expit
 from scipy.special import expit as npexpit
-from statsmodels.tsa.stattools import acf
 import matplotlib.pyplot as plt
 import pickle
 plt.rcParams.update({'text.usetex':True,'font.serif': ['cm'],'font.size':16})
@@ -22,13 +21,14 @@ figdir='figs'
 
 #%%
 class MyBatcher:
-    def __init__(self,data,bs,n_paths,strat):
+    def __init__(self, data, K, n_paths, strat):
         self.data=data
         self.length = len(data)
         shape=tuple([n_paths]+[1 for i in data.shape])
         self.datasource = data[None,...].repeat(shape)
-        self.bs=bs
-        self.K=self.length//self.bs 
+        self.K=min(K,self.length)
+        print(f'Set K to {self.K}')
+        self.bs=int(self.length/K) + 1*(self.length%K!=0)
         self.index=0
         self.n_paths=n_paths
         self.set_strat(strat)
@@ -174,7 +174,7 @@ class HMCIntegrators:
         return qp
     
 class LogRegExp(HMCIntegrators):
-    def __init__(self,data,bs,n_paths,strat='RM'):
+    def __init__(self,data,K,n_paths,strat='RM'):
         self.x,self.y=data
         self.n=self.x.shape[0] 
         #Add dummy for bias
@@ -190,7 +190,7 @@ class LogRegExp(HMCIntegrators):
         J+=self.Cinv
         Jchol=cholesky(J, upper=True)
         data_comb=torch.cat((self.xnew,self.y[...,None]),dim=-1)
-        mybatcher=MyBatcher(data=data_comb,bs=bs,n_paths=n_paths,strat=strat)
+        mybatcher=MyBatcher(data=data_comb,K=K,n_paths=n_paths,strat=strat)
         super().__init__(J, Jchol, MAP,mybatcher)
 
     def U(self,q):
@@ -223,7 +223,8 @@ class LogRegExp(HMCIntegrators):
        term=torch.matmul(self.Cinv[None,...],q) #q has shape (n_paths,n_features,1)
        arg=torch.matmul(x,q) #has shape (n_paths,n,1)
        temp=y[...,None]-expit(arg) #has shape (n_paths,n,1)
-       return term-self.mybatcher.K*torch.matmul(x.permute(0,2,1),temp)
+       scaler=x.shape[1]/self.mybatcher.bs
+       return scaler*(term-self.mybatcher.K*torch.matmul(x.permute(0,2,1),temp))
     
     def calc_MAP(self):
         x0=np.random.randn(*self.xnew.shape[1:])*.2
@@ -232,7 +233,7 @@ class LogRegExp(HMCIntegrators):
 
 
 class GaussianExp(HMCIntegrators):
-    def __init__(self,x,bs,n_paths,strat='RM'):
+    def __init__(self,x,K,n_paths,strat='RM'):
         self.x=x
         self.n=x.shape[0] # # of data points, which should always be > # of params
         MAP=self.x.mean(dim=0)
@@ -240,7 +241,7 @@ class GaussianExp(HMCIntegrators):
         self.cov=torch.cov(x.T).reshape(x.shape[1],x.shape[1]) #x has shape (n,features)
         self.truecov=self.cov/self.n
 
-        mybatcher=MyBatcher(data=self.x,bs=bs,n_paths=n_paths,strat=strat)
+        mybatcher=MyBatcher(data=self.x,K=K,n_paths=n_paths,strat=strat)
         Jchol=cholesky(torch.linalg.inv(self.cov), upper=True)*torch.sqrt(torch.tensor(self.n))
         super().__init__(Jchol.T@Jchol, Jchol, MAP,mybatcher)
         
@@ -352,7 +353,7 @@ def runLRExp(expname,K,n_paths=10**4):
     Nsamples_HMC=10**7
     
     if expname=='Chess':
-        data = pd.read_table('chess.txt', sep=",", header=None)
+        data = pd.read_table('data/chess.txt', sep=",", header=None)
         y = np.array(data.iloc[:,-1]=='won',dtype=np.float64)
         X = data.iloc[:,:-1]
         x = np.zeros_like(X,dtype=np.float64)
@@ -360,14 +361,14 @@ def runLRExp(expname,K,n_paths=10**4):
             x[:,i] = pd.factorize(X.iloc[:,i],sort=True)[0]
         x,y=torch.tensor(x),torch.tensor(y)
     elif expname=='StatLog':
-        data = pd.read_table('satTrn.txt', header=None, sep=' ')
+        data = pd.read_table('data/satTrn.txt', header=None, sep=' ')
         X = np.array(data.iloc[:,:-1])
         x = StandardScaler().fit_transform(X)
         y = np.array(data.iloc[:,-1])
         y=np.where(y==2,1,0)
         x,y=torch.tensor(x),torch.tensor(y)
     elif expname=='CTG':
-        ctg = pd.read_table('CTG.txt',header=0)
+        ctg = pd.read_table('data/CTG.txt',header=0)
         X = np.array(ctg.iloc[:,:21])
         x = StandardScaler().fit_transform(X)
         y = np.array(ctg.iloc[:,-1])
@@ -397,8 +398,7 @@ def runLRExp(expname,K,n_paths=10**4):
         raise ValueError('expname not valid: choose one of StatLog,Chess,CTG,SimData.')
     
     N=len(x)
-    bs=N//K
-    Exp1=LogRegExp([x,y],bs,n_paths=n_paths)
+    Exp1=LogRegExp([x,y],K,n_paths=n_paths)
     try:
         with open(f"LogReg_{expname}HMCtruemean.pkl", 'rb') as f:
             truemean=pickle.load(f).detach()
@@ -424,10 +424,21 @@ def runLRExp(expname,K,n_paths=10**4):
         stoch=True
         if strat=='FULLGRAD':
             stoch=False
-            Exp1=LogRegExp([x,y],bs,n_paths=20)
+            Exp1=LogRegExp([x,y],K,n_paths=20)
         for i,timestep in enumerate(etarange):
             samples=getLD(Exp1,timestep,Nsamples[i],strat=strat,pcond=True,stoch=stoch) 
             sgld_dict[strat][str(timestep.item())]=samples
 
     with open(f"LogReg{expname}_SGLDK{K}.pkl", 'wb') as f:
         pickle.dump(sgld_dict,f)
+
+#%%
+runLRExp('CTG', 16, 20)
+runLRExp('StatLog', 16, 20)
+runLRExp('Chess', 16, 20)
+runLRExp('SimData', 16, 20)
+
+plotter('CTG', 16)
+plotter('StatLog', 16)
+plotter('Chess', 16)
+plotter('SimData', 16)
