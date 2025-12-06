@@ -1,287 +1,366 @@
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import StandardScaler,PolynomialFeatures
-from torch import cholesky_solve as cho_solve
-from torch.linalg import solve_triangular, cholesky
+from sklearn.preprocessing import StandardScaler
+from scipy.linalg import solve_triangular, cholesky, cho_solve
 import os
-from scipy.optimize import fsolve,minimize
-from torch import sigmoid as expit
 from scipy.special import expit as npexpit
 import matplotlib.pyplot as plt
 import pickle
-plt.rcParams.update({'text.usetex':True,'font.serif': ['cm'],'font.size':16})
+plt.rcParams.update({'text.usetex':False,'font.serif': ['cm'],'font.size':16})
 plt.rcParams['figure.dpi'] = 1000
 plt.rcParams['savefig.dpi'] = 1000
-plt.rc('text', usetex=True)
-plt.rc('font',**{'serif':['cm']})
 plt.style.use('seaborn-v0_8-paper')
 import time as time
 figdir='figs'
 
+plt.rcParams.update({'text.usetex':True,'font.serif': ['cm'],'font.size':16})
+plt.rcParams['figure.dpi'] = 1000
+plt.rcParams['savefig.dpi'] = 1000
+plt.style.use('seaborn-v0_8-paper')
+import time as time
+figdir='figs'
+resultsdir='RESULTS'
+datadir='data'
 #%%
 class MyBatcher:
-    def __init__(self, data, K, n_paths, strat):
+    def __init__(self,data,K,n_paths,strat=None):
         self.data=data
         self.length = len(data)
-        shape=tuple([n_paths]+[1 for i in data.shape])
-        self.datasource = data[None,...].repeat(shape)
+        # shape=tuple([n_paths]+[1 for i in data.shape])
+        # self.datasource = data[None,...].repeat(shape)
+
+        self.datasource = data[None,...].repeat(repeats=n_paths,axis=0)
         self.K=min(K,self.length)
         print(f'Set K to {self.K}')
         self.bs=int(self.length/K) + 1*(self.length%K!=0)
         self.index=0
         self.n_paths=n_paths
-        self.set_strat(strat)
+        self.strat=None
+        self.sample= self.NoSampler
     
+    def redraw(self):
+        d=self.data[np.argsort(np.random.rand(*(self.n_paths,self.length)), axis=-1)]
+        if self.strat=='SMS':
+            self.datasource=np.concatenate((d,np.flip(d,axis=(1,))),axis=1)
+        else:
+            self.datasource=d
+
     def set_strat(self,strat):
+        self.index=0
         if strat=='RR':
             print('RR selected')
+            self.strat='RR'
             self.sample=self.RRsampler
+        elif strat=='SMS':
+            print('SMS selected')
+            self.strat='SMS'
+            self.sample=self.SMSsampler
+
+
+        elif strat=='SO':
+            print('SO selected')
+            self.strat='SO'
+            self.redraw()
+            self.sample=self.SOsampler
         else:
             print('RM selected')
+            self.strat='RM'
             self.sample=self.RMsampler
             
     def RRsampler(self):
         if self.index==0:
-            self.datasource=self.data[torch.argsort(torch.rand(size=(self.n_paths,self.length)), dim=-1)]
-        k,bs=self.index,self.bs
+            self.redraw()
+        data=self.datasource[:,self.index*self.bs:(self.index+1)*self.bs]
         self.index=(self.index+1)%self.K 
-        data=self.datasource[:,k*bs:(k+1)*bs]
+        return data
+    
+    def SOsampler(self):
+        data=self.datasource[:,self.index*self.bs:(self.index+1)*self.bs]
+        self.index=(self.index+1)%self.K 
+        return data
+    
+    def SMSsampler(self):
+        if self.index==0:
+            self.redraw()
+            idx=self.bs if self.length%self.bs==0 else self.length%self.bs
+            data=self.datasource[:,:idx]
+            self.datasource=self.datasource[:,idx:]
+        else:
+            data=self.datasource[:,(self.index-1)*self.bs:self.index*self.bs]
+        self.index=(self.index+1)%(2*self.K)
         return data
 
     def RMsampler(self):
         if self.index==0:
-            self.datasource=self.data[torch.argsort(torch.rand(size=(self.n_paths,self.length)), dim=-1)]
+            self.redraw()
         k_=np.random.randint(low=0,high=self.length)
-        self.index=(self.index+1)%self.K 
+        self.index=(self.index+1)%self.K
         inds=np.arange(k_,k_+self.bs)%self.length
         data=self.datasource[:,inds]
         return data
+    
+    def NoSampler(self):
+        raise Exception('Sampling strategy not been defined!')
 
-class HMCIntegrators:
-    def __init__(self, J, Jchol, MAP,mybatcher):
-        self.J=J
-        self.Jchol=Jchol
-        self.MAP=MAP
-        self.mybatcher=mybatcher
-    
-    def U(self,q):
-        return 
-    
-    def grad(self,q):
-        return 
-    
-    def stochgrad(self,q,data):
-        return 
-
-    def partialgrad(self,q):
-        U_dash=self.grad(q)
-        return U_dash-self.J@(q-self.MAP)
+class Loss:
+    def __init__(self,data,K,n_paths,strat='RM', Cinv=None):
+        self.x, self.y = data
+        self.n = int(self.x.shape[0])
+        # Add dummy for bias
+        self.xnew = np.concatenate((self.x, np.ones((self.n, 1))), axis=1)
+        if not Cinv:
+            self.Cinv = 0
+            L = self.smoothness()
+            self.Cinv = L / np.sqrt(self.n)
+        else:
+            self.Cinv = Cinv
+        if self.Cinv.shape != ():
+            raise ValueError('Cinv can only be scalar!')
+        self.MAP = self.calc_MAP()
+        data_comb = np.concatenate((self.xnew, self.y[..., None]), axis=-1)
+        self.mybatcher = MyBatcher(data=data_comb, K=K, n_paths=n_paths, strat=strat)
     
     def set_strat(self,strat):
         if strat=='RR':
             self.mybatcher.set_strat('RR')
+        elif strat=='SMS':
+            self.mybatcher.set_strat('SMS')
         else:
             self.mybatcher.set_strat('RM')
 
+    def NLogLoss(self,q):
+        return
     
-    def HMCsample(self,q0,hmed,T,Nsamples):
-        q=q0.clone().detach()
-        acc=0
-        ham=lambda q,v:.5*torch.sum(v*(self.J[None,...]@v))+self.U(q)
-        samples=torch.zeros((Nsamples,*q.shape))
-        Nsteps=int(torch.floor(T/hmed))
-        for n in range(0,Nsamples):
-            h=(1.-0.2*torch.rand(1))*hmed
-            v=solve_triangular(self.Jchol[None,...], torch.randn_like(q),upper=True) #Draw v ~ N(0,Jinv)
-            qp=q.detach()
-            H0=ham(q,v)
-            
-            #Do a leg of T//h steps of Strang
-            qp,v=self.PrecondVerlet(qp,v,Nsteps,h)
-
-            accept=H0-ham(qp,v) #acceptance probability
-            #Accept/reject
-            if (accept>torch.log(torch.rand(1))):
-                acc+=1
-                q=qp 
-            else:
-                pass
-            samples[n]=q
-        return acc/Nsamples,samples
+    def grad(self,q,data):
+        return
     
-    def LDsample(self,q0,hmed,Nsamples,pcond=False,stoch=True):
-        q=q0.clone().detach()
-        samples=torch.zeros((Nsamples,*q.shape))
-        # log_posts = np.empty(Nsamples)
-        if stoch:
-            integ=self.PSGLD if pcond else self.SGLD
-        else:
-            integ=self.PLD if pcond else self.LD
-        #Burnin
-        for n in range(0,1000):
-            q=integ(q,hmed)
+    def fullgradient(self,q):
+        return
+    
+    def stochgrad(self,q):
+        data=self.mybatcher.sample()
+        scaler=data.shape[1]/self.mybatcher.bs
+        return self.grad(q,data)*scaler
+    
+    def calc_MAP(self,epochs):
+        return
+    
+    def smoothness(self):
+        return
+        
+class Sampler:
+    def __init__(self, loss, method='SGLD',strat='RM'):
+        self.loss = loss
+        self.loss.set_strat(strat)
+        self.strat=strat
+        self.method=method.lower()
+        if self.method=='hmc':
+            self.stepper=self.HMC
+            self.HMCsteps = 3
+            self.ham = lambda q,v:.5*np.sum(v*(self.loss.J[None,...]@v))+self.loss.U(q)
+        elif self.method=='sgld':
+            self.stepper=self.SGLD
+            raise ValueError('method arg to Optimizer class not recognised: sgd, nesterov, heavyball and ubu are only available methods.')
             
-        for n in range(0,Nsamples):
-            q=integ(q,hmed)
-            # log_posts[n] = self.log_posterior(q)
+    def run(self, q0, h0, Niters):
+        q=np.float64(q0.copy())
+        v=np.zeros_like(q)
+        epochs=Niters//self.loss.mybatcher.K
+        epochs+=1*epochs%2 #need number of epochs to be even for SMS
+        Niters=epochs*self.loss.mybatcher.K
+        samples=np.zeros((Niters,*q.shape))
+        h=h0
+        for n in range(0,Niters):
+            q,v=self.stepper(q,v,h)
             samples[n]=q
-        return samples,None #log_posts
+        return samples
 
-    ##PrecondIntegrators##
-    def PrecondVerlet(self,qp,v,Nsteps,h):
+    def SGLD(self, qp, v, h): 
+        eta = np.sqrt(2*h)*solve_triangular(self.loss.Jchol[None,...], np.random.randn(*qp.shape), lower=False)
+        grad = self.loss.stochgrad(qp)
+        update=cho_solve((self.Jchol[None,...], False), grad)
+        qp = qp - h*update + eta
+        return qp, v
+    
+    def HMC(self, q, v, h): 
+        h=(1.-0.2*np.random.rand(1))*h
+        v=solve_triangular(self.loss.Jchol[None,...], np.random.randn(*q.shape), lower=False)#Draw v ~ N(0,Jinv)
+        qp = q
+        H0=self.ham(qp,v)
+        Nsteps = self.HMCsteps
+        
         #Do a leg of T//h steps of Strang
         #(b1) Kick
         theta1=h/2
-        v-=theta1*cho_solve(self.grad(qp),self.Jchol[None,...],upper=True)
-        for t in torch.arange(Nsteps):
+        v-=theta1*cho_solve((self.loss.Jchol[None, ...], False), self.loss.fullgradient(qp))
+        for t in range(Nsteps):
             qp+=h*v #Drift
             theta = 2*theta1 if (t!=Nsteps-1) else theta1
-            v-=theta*cho_solve(self.grad(qp),self.Jchol[None,...],upper=True)
-        return qp,v
+            v-=theta*cho_solve((self.loss.Jchol[None,...], False), self.loss.fullgradient(qp))
 
+        accept=H0-self.ham(qp,v) #acceptance probability
+        #Accept/reject
+        if (accept>np.log(np.random.rand(1))):
+            q=qp 
+        return q, v
     
-    ##Stochastic Gradient##
-    def PSGLD(self,qp,h):
-        data=self.mybatcher.sample()
-        eta = torch.sqrt(2*h)*solve_triangular(self.Jchol[None,...], torch.randn_like(qp),upper=True)
-        grad = self.stochgrad(qp,data)
-        update=cho_solve(grad,self.Jchol[None,...],upper=True)
-        qp = qp - h*update + eta
-        return qp
-
-    def SGLD(self,qp,h):
-        data=self.mybatcher.sample()
-        eta = torch.sqrt(2*h)*torch.randn_like(qp)
-        grad = self.stochgrad(qp,data)
-        update=grad
-        qp = qp - h*update + eta
-        return qp
+class LogReg(Loss):
+    def __init__(self,data,K,n_paths):
+        super().__init__(data, K, n_paths)
+        arg=self.xnew@self.MAP
+        J=self.xnew.T*(npexpit(arg)*npexpit(-arg))@self.xnew
+        J += self.Cinv
+        Jchol = cholesky(J, lower=False)
+        self.J = J
+        self.Jchol = Jchol
     
-    ##Full Gradient##
-    def LD(self,qp,h):
-        eta = torch.sqrt(2*h)*torch.randn_like(qp)
-        grad = self.grad(qp)
-        update=grad
-        qp = qp - h*update + eta
-        return qp
+    def smoothness(self):
+        covariance = self.xnew.T@self.xnew/self.n
+        return 0.25*np.max(np.linalg.eigvalsh(covariance)) + self.Cinv
     
-    def PLD(self,qp,h):
-        eta = torch.sqrt(2*h)*solve_triangular(self.Jchol[None,...], torch.randn_like(qp),upper=True)
-        grad = self.grad(qp)
-        update=cho_solve(grad,self.Jchol[None,...],upper=True)
-        qp = qp - h*update + eta
-        return qp
-    
-class LogRegExp(HMCIntegrators):
-    def __init__(self,data,K,n_paths,strat='RM'):
-        self.x,self.y=data
-        self.n=self.x.shape[0] 
-        #Add dummy for bias
-        self.xnew=torch.cat((self.x,torch.ones((self.n,1))),dim=1)
-        I=torch.eye(self.xnew.shape[1]).to(self.xnew.dtype)
-        self.C=I*25.
-        self.Cinv=I/25.
-
-        MAP=torch.tensor(self.calc_MAP())
-        #calculate hessian at MAP
-        arg=self.xnew@MAP
-        J=self.xnew.T*(expit(arg)*expit(-arg))@self.xnew
-        J+=self.Cinv
-        Jchol=cholesky(J, upper=True)
-        data_comb=torch.cat((self.xnew,self.y[...,None]),dim=-1)
-        mybatcher=MyBatcher(data=data_comb,K=K,n_paths=n_paths,strat=strat)
-        super().__init__(J, Jchol, MAP,mybatcher)
-
     def U(self,q):
         arg=self.xnew@q
-        ans=-torch.sum(self.y[None,...,None]*arg)
-        ans+=torch.sum(torch.logaddexp(torch.zeros_like(arg),arg))
-        term=q*torch.matmul(self.Cinv[None,...],q)
-        return .5*torch.sum(term)+ans
-    
-    def grad(self,q):
-        term=torch.matmul(self.Cinv[None,...],q)
-        arg=torch.matmul(self.xnew,q)
-        temp=self.y[None,...,None]-expit(arg) #has shape (n_paths,n,1)
-        return term-torch.matmul(self.xnew.T[None,...],temp)
-    
-    def _U(self,q): ##np version
-        arg=self.xnew@q
-        ans=-np.dot(self.y,arg)
-        ans+=(np.logaddexp(0.0,arg)).sum()
-        return .5*(np.dot(q,self.Cinv@q))+ans
-
-    def _grad(self,q): ##np version
-        term=self.Cinv@q
-        arg=self.xnew@q
-        temp=(self.y-npexpit(arg))
-        return term-self.xnew.T@temp
-    
-    def stochgrad(self,q,data):
-       x,y=data[...,:-1],data[...,-1] #x has shape (n_paths,n,n_features)
-       term=torch.matmul(self.Cinv[None,...],q) #q has shape (n_paths,n_features,1)
-       arg=torch.matmul(x,q) #has shape (n_paths,n,1)
-       temp=y[...,None]-expit(arg) #has shape (n_paths,n,1)
-       scaler=x.shape[1]/self.mybatcher.bs
-       return scaler*(term-self.mybatcher.K*torch.matmul(x.permute(0,2,1),temp))
+        ans=-np.sum(self.y[None,...,None]*arg)
+        ans+=np.sum(np.logaddexp(np.zeros_like(arg),arg))
+        term=q*self.Cinv*q
+        return .5*np.sum(term)+ans/self.n
     
     def calc_MAP(self):
-        x0=np.random.randn(*self.xnew.shape[1:])*.2
-        guess=fsolve(self._grad,x0=x0)
-        return minimize(self._U,x0=guess).x
+        x=np.random.randn(1, *self.xnew.shape[1:], 1)*.2 # (n_paths, n_features, 1)
+        lr=1/self.smoothness()
+        kappa = (1/lr)/self.Cinv
+        momentum = (np.sqrt(kappa)-1) / (np.sqrt(kappa)+1)
+        x_nest = x.copy()
+        history=[x]
+        nepochs=600
+        for i in range(nepochs):
+            x_nest_old = x_nest.copy()
+            g = self.fullgradient(x)
+            x_nest = x - lr*g
+            x = x_nest + momentum*(x_nest-x_nest_old)
+            history+=[x]
+        history=np.array(history).squeeze()
+        err=np.linalg.norm(history[:-1]-history[-1],axis=-1)
+        plt.semilogy(np.arange(len(err)),err)
+        plt.xlabel('Iterations')
+        plt.ylabel('$\|x-x_*\|$')
+        plt.title('Correctly found minimum with fullgrad Nesterov')
+        return x.squeeze()
+    
+    def fullgradient(self,q): ## np version
+        term=q*self.Cinv
+        arg=np.matmul(self.xnew[None,...],q)
+        temp=(self.y[...,None]-npexpit(arg))
+        return term-np.matmul(self.xnew[None,...].transpose(0,2,1),temp)/self.n
+    
+    def grad(self, q, data):
+       x,y=data[...,:-1],data[...,-1] #x has shape (n_paths, n, n_features)
+       term=q*self.Cinv #q has shape (n_paths,n_features,1)
+       arg=np.matmul(x,q) #has shape (n_paths,n,1)
+       temp=y[...,None]-npexpit(arg) #has shape (n_paths,n,1)
+       bs=x.shape[1] #self.n divide term/self.mybatcher.K for true splitting scheme
+       return term-np.matmul(x.transpose(0,2,1),temp)/bs
 
-
-class GaussianExp(HMCIntegrators):
+class GaussianExp(Loss):
     def __init__(self,x,K,n_paths,strat='RM'):
-        self.x=x
-        self.n=x.shape[0] # # of data points, which should always be > # of params
-        MAP=self.x.mean(dim=0)
-        self.truemean=MAP.unsqueeze(-1)
-        self.cov=torch.cov(x.T).reshape(x.shape[1],x.shape[1]) #x has shape (n,features)
-        self.truecov=self.cov/self.n
-
-        mybatcher=MyBatcher(data=self.x,K=K,n_paths=n_paths,strat=strat)
-        Jchol=cholesky(torch.linalg.inv(self.cov), upper=True)*torch.sqrt(torch.tensor(self.n))
-        super().__init__(Jchol.T@Jchol, Jchol, MAP,mybatcher)
+        super().__init__((x, None), K, n_paths, Cinv=0.)
+        self.truemean=self.MAP
+        self.truecov=np.cov(self.x.T).reshape(self.x.shape[1],self.x.shape[1]) #x has shape (n,features)
+        self.J = np.linalg.inv(self.truecov)
+        self.Jchol = cholesky(self.J, lower=False)
         
-        
+    def calc_MAP(self, epochs):
+        return self.x.mean(dim=0)
+    
     def U(self,q):
         arg=torch.matmul(self.Jchol[None,...], (q-self.truemean[None,...]))
         ans=torch.sum(arg*arg)
         return .5*ans
     
-    def grad(self,q):
-        return torch.matmul(self.J[None,...], (q-self.truemean[None,...]))
+    def grad(self, q, data):
+        x = data[...,:-1] #x has shape (n_paths,n,n_features)
+        return np.matmul(self.J[None,...], (q-x.mean(axis=1, keepdims=False)[None,...]))
+    
+    def fullgradient(self, q):
+        return np.matmul(self.J[None,...], (q-self.truemean[None,...]))
 
-    def stochgrad(self,q,data):
-        return torch.matmul(self.J[None,...],q-data.mean(dim=1,keepdims=False)[...,None])
+def getprogress(opt, h, Niters):
+    q0 = opt.loss.MAP[None,...,None].repeat(repeats=opt.loss.mybatcher.n_paths,axis=0)
+    s=opt.run(q0, h, Niters=Niters)
+    return s
 
 
-def getHMC(Exp1,h,Tp,Nsamples):
-    #Preconditioned
-    start=time.time()
-    q0=Exp1.MAP[None,...].unsqueeze(-1)
-    acc,s=Exp1.HMCsample(q0, h, Tp,Nsamples)
-    end=time.time()
-    samples={'acc':acc,'samples':s,'h':h,'T':Tp,'Exp':Exp1,'type':'pHMC'}
-    samples['exec_time']=end-start
-    print('HMC'+f', acc={acc}')
-    return samples
+def get_loss(expname,K,n_paths=100,exp='LogReg'):
 
-def getLD(Exp1,h, Nsamples,strat='RR',pcond=True,stoch=True):
-    start=time.time()
-    if stoch:
-        Exp1.set_strat(strat)
+    if expname=='Chess':
+        data = pd.read_table(datadir+'/chess.txt', sep=",", header=None)
+        y = np.array(data.iloc[:,-1]=='won',dtype=np.float64)
+        X = data.iloc[:,:-1]
+        x = np.zeros_like(X,dtype=np.float64)
+        for i in range(x.shape[-1]): 
+            x[:,i] = pd.factorize(X.iloc[:,i],sort=True)[0]
+    elif expname=='StatLog':
+        data = pd.read_table(datadir+'/satTrn.txt', header=None, sep=' ')
+        X = np.array(data.iloc[:,:-1])
+        x = StandardScaler().fit_transform(X)
+        y = np.array(data.iloc[:,-1])
+        y=np.where(y==2,1,0)
+    elif expname=='CTG':
+        ctg = pd.read_table(datadir+'/CTG.txt',header=0)
+        X = np.array(ctg.iloc[:,:21])
+        x = StandardScaler().fit_transform(X)
+        y = np.array(ctg.iloc[:,-1])
+        y=np.where(y>2,1,0)
+    elif expname=='SimData':
+        try:
+            with open(datadir+"/SimData.pkl", 'rb') as f:
+                d=pickle.load(f)
+                x=d['x']
+                y=d['y']
+        except:
+            print('Generating simulated data for log reg experiment.')
+            np.random.seed(2024)
+            d=25
+            p=d+1
+            N=2**10
+            scaler=np.hstack((5*np.ones(shape=(1,5)),np.ones(shape=(1,5)),.2*np.ones(shape=(1,d-10))))
+            params=np.random.normal(size=(p,))
+            x=np.random.normal(size=(N,d),scale=scaler) #input data
+            xnew=np.hstack((np.ones(shape=(N,1)),x))
+            p_i=npexpit((xnew@params))
+            y=np.random.binomial(1, p_i).flatten() # output data
+            with open("SimData.pkl", 'wb') as f:
+                pickle.dump({'x':x,'y':y,'params':params},f)
+    elif expname=='SimpleData':
+        try:
+            with open(datadir+"/SimpleData.pkl", 'rb') as f:
+                d=pickle.load(f)
+                x=d['x']
+                y=d['y']
+        except:
+            print('Generating simulated data for lin reg experiment.')
+            np.random.seed(2024)
+            # True parameters
+            w_true = 2.0
+            b_true = 0.1
+            
+            # Generate noisy dataset
+            x = np.array([1, 2, 3, 4, 5], dtype=np.float64)[...,None]
+            y = (w_true * x + b_true).flatten() + 0.2*np.random.randn(len(x))
+    
+            with open(datadir+"/SimpleData.pkl", 'wb') as f:
+                pickle.dump({'x':x,'y':y,'params':[b_true,w_true]},f)
+
     else:
-        strat='FULLGRAD'
-    shape=tuple([Exp1.mybatcher.n_paths]+[1 for i in Exp1.MAP.shape])
-    q0=Exp1.MAP[None,...].repeat(shape).unsqueeze(-1)
-    s,lp=Exp1.LDsample(q0, h, pcond=pcond,Nsamples=Nsamples,stoch=stoch)
-    end=time.time()
-    samples={'samples':s,'h':h,'logpost':lp,'RandPol':strat,'stoch':stoch}
-    samples['exec_time']=end-start
-    return samples
+        raise ValueError('expname not valid: choose one of StatLog,Chess,CTG,SimData.')
+    
+    N=len(x)
+    if exp=='LogReg':
+        loss=LogReg([x,y],K,n_paths=n_paths)
+    else:
+        raise ValueError('Exp type not recognised.')
+    return loss
 
 
 def plotter(expname,K):
@@ -350,65 +429,18 @@ def plotter(expname,K):
     plt.savefig(os.path.join(figdir,f'LogReg{expname}K{K}.pdf'),format='pdf',bbox_inches='tight')
 
 def runLRExp(expname,K,n_paths=10**4):
-    Nsamples_HMC=10**7
-    
-    if expname=='Chess':
-        data = pd.read_table('data/chess.txt', sep=",", header=None)
-        y = np.array(data.iloc[:,-1]=='won',dtype=np.float64)
-        X = data.iloc[:,:-1]
-        x = np.zeros_like(X,dtype=np.float64)
-        for i in range(x.shape[-1]): 
-            x[:,i] = pd.factorize(X.iloc[:,i],sort=True)[0]
-        x,y=torch.tensor(x),torch.tensor(y)
-    elif expname=='StatLog':
-        data = pd.read_table('data/satTrn.txt', header=None, sep=' ')
-        X = np.array(data.iloc[:,:-1])
-        x = StandardScaler().fit_transform(X)
-        y = np.array(data.iloc[:,-1])
-        y=np.where(y==2,1,0)
-        x,y=torch.tensor(x),torch.tensor(y)
-    elif expname=='CTG':
-        ctg = pd.read_table('data/CTG.txt',header=0)
-        X = np.array(ctg.iloc[:,:21])
-        x = StandardScaler().fit_transform(X)
-        y = np.array(ctg.iloc[:,-1])
-        y=np.where(y>2,1,0)
-        x,y=torch.tensor(x),torch.tensor(y)
-    elif expname=='SimData':
-        try:
-            with open("SimData.pkl", 'rb') as f:
-                d=pickle.load(f)
-                x=torch.tensor(d['x'])
-                y=torch.tensor(d['y'])
-        except:
-            print('Generating simulated data for log reg experiment.')
-            np.random.seed(2024)
-            d=25
-            p=d+1
-            N=2**10
-            scaler=np.hstack((5*np.ones(shape=(1,5)),np.ones(shape=(1,5)),.2*np.ones(shape=(1,d-10))))
-            params=np.random.normal(size=(p,))
-            x=np.random.normal(size=(N,d),scale=scaler) #input data
-            xnew=np.hstack((np.ones(shape=(N,1)),x))
-            p_i=expit(torch.tensor(xnew@params))
-            y=np.random.binomial(1, p_i).flatten() # output data
-            with open("SimData.pkl", 'wb') as f:
-                pickle.dump({'x':x,'y':y,'params':params},f)
-    else:
-        raise ValueError('expname not valid: choose one of StatLog,Chess,CTG,SimData.')
-    
-    N=len(x)
-    Exp1=LogRegExp([x,y],K,n_paths=n_paths)
+    Nsamples_HMC = 10**7
+    loss = get_loss(expname, K, n_paths=n_paths, exp='LogReg')
     try:
         with open(f"LogReg_{expname}HMCtruemean.pkl", 'rb') as f:
             truemean=pickle.load(f).detach()
     except:
         print(f'Running HMC sampler to get true mean with {Nsamples_HMC} samples.')
         #HMC to get mean
-        Tp=torch.tensor(torch.pi/2)
-        hpV=Tp/3
-        samples=getHMC(Exp1,hpV,Tp,Nsamples_HMC) 
-        truemean=samples['samples'].mean(axis=0)
+        hpV = np.pi/6
+        sampler = Sampler(loss, method='hmc',strat='RM')
+        samples = getprogress(sampler, hpV, Nsamples_HMC)
+        truemean = samples['samples'].mean(axis=0)
 
         with open(f"LogReg_{expname}HMCtruemean.pkl", 'wb') as f:
             pickle.dump(truemean,f)
@@ -418,16 +450,16 @@ def runLRExp(expname,K,n_paths=10**4):
 
     strats=['RR','RM','FULLGRAD']
     sgld_dict={s:{} for s in strats}
-    sgld_dict['K']=K
+    sgld_dict['K'] = K
     sgld_dict['etarange']=etarange
     for strat in strats:
-        stoch=True
         if strat=='FULLGRAD':
-            stoch=False
-            Exp1=LogRegExp([x,y],K,n_paths=20)
+            new_loss = get_loss(expname, 1, n_paths=20, exp='LogReg') # set K = 1
+            sampler = Sampler(new_loss, method='sgld')
         for i,timestep in enumerate(etarange):
-            samples=getLD(Exp1,timestep,Nsamples[i],strat=strat,pcond=True,stoch=stoch) 
-            sgld_dict[strat][str(timestep.item())]=samples
+            sampler = Sampler(loss, method='sgld',strat=strat)
+            samples = getprogress(sampler, timestep, Nsamples[i])
+            sgld_dict[strat][str(timestep.item())] = samples
 
     with open(f"LogReg{expname}_SGLDK{K}.pkl", 'wb') as f:
         pickle.dump(sgld_dict,f)
