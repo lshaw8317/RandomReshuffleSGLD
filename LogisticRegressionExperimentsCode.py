@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.preprocessing import StandardScaler
 from scipy.linalg import solve_triangular, cholesky, cho_solve
 import os
@@ -8,13 +7,6 @@ from scipy.special import expit as npexpit
 import matplotlib.pyplot as plt
 import pickle
 plt.rcParams.update({'text.usetex':False,'font.serif': ['cm'],'font.size':16})
-plt.rcParams['figure.dpi'] = 1000
-plt.rcParams['savefig.dpi'] = 1000
-plt.style.use('seaborn-v0_8-paper')
-import time as time
-figdir='figs'
-
-plt.rcParams.update({'text.usetex':True,'font.serif': ['cm'],'font.size':16})
 plt.rcParams['figure.dpi'] = 1000
 plt.rcParams['savefig.dpi'] = 1000
 plt.style.use('seaborn-v0_8-paper')
@@ -37,7 +29,7 @@ class MyBatcher:
         self.index=0
         self.n_paths=n_paths
         self.strat=None
-        self.sample= self.NoSampler
+        self.sample = self.NoSampler
     
     def redraw(self):
         d=self.data[np.argsort(np.random.rand(*(self.n_paths,self.length)), axis=-1)]
@@ -56,8 +48,6 @@ class MyBatcher:
             print('SMS selected')
             self.strat='SMS'
             self.sample=self.SMSsampler
-
-
         elif strat=='SO':
             print('SO selected')
             self.strat='SO'
@@ -114,7 +104,7 @@ class Loss:
             L = self.smoothness()
             self.Cinv = L / np.sqrt(self.n)
         else:
-            self.Cinv = Cinv
+            self.Cinv = np.asarray(Cinv)
         if self.Cinv.shape != ():
             raise ValueError('Cinv can only be scalar!')
         self.MAP = self.calc_MAP()
@@ -157,13 +147,16 @@ class Sampler:
         self.method=method.lower()
         if self.method=='hmc':
             self.stepper=self.HMC
-            self.HMCsteps = 3
+            self.HMCsteps = 2
             self.ham = lambda q,v:.5*np.sum(v*(self.loss.J[None,...]@v))+self.loss.U(q)
         elif self.method=='sgld':
             self.stepper=self.SGLD
-            raise ValueError('method arg to Optimizer class not recognised: sgd, nesterov, heavyball and ubu are only available methods.')
+        else:
+            raise ValueError('method arg to Sampler class not recognised: sgld and hmc are only available methods.')
             
     def run(self, q0, h0, Niters):
+        global acc
+        acc = 0
         q=np.float64(q0.copy())
         v=np.zeros_like(q)
         epochs=Niters//self.loss.mybatcher.K
@@ -174,16 +167,18 @@ class Sampler:
         for n in range(0,Niters):
             q,v=self.stepper(q,v,h)
             samples[n]=q
+        print(f'Acceptance rate = {round(100 * acc / Niters, 2)}')
         return samples
 
     def SGLD(self, qp, v, h): 
         eta = np.sqrt(2*h)*solve_triangular(self.loss.Jchol[None,...], np.random.randn(*qp.shape), lower=False)
         grad = self.loss.stochgrad(qp)
-        update=cho_solve((self.Jchol[None,...], False), grad)
+        update=cho_solve((self.loss.Jchol[None,...], False), grad)
         qp = qp - h*update + eta
         return qp, v
     
     def HMC(self, q, v, h): 
+        global acc
         h=(1.-0.2*np.random.rand(1))*h
         v=solve_triangular(self.loss.Jchol[None,...], np.random.randn(*q.shape), lower=False)#Draw v ~ N(0,Jinv)
         qp = q
@@ -203,11 +198,12 @@ class Sampler:
         #Accept/reject
         if (accept>np.log(np.random.rand(1))):
             q=qp 
+            acc += 1
         return q, v
     
 class LogReg(Loss):
     def __init__(self,data,K,n_paths):
-        super().__init__(data, K, n_paths)
+        super().__init__(data, K, n_paths, Cinv=1./25.)
         arg=self.xnew@self.MAP
         J=self.xnew.T*(npexpit(arg)*npexpit(-arg))@self.xnew
         J += self.Cinv
@@ -223,7 +219,7 @@ class LogReg(Loss):
         arg=self.xnew@q
         ans=-np.sum(self.y[None,...,None]*arg)
         ans+=np.sum(np.logaddexp(np.zeros_like(arg),arg))
-        term=q*self.Cinv*q
+        term=q*self.Cinv*q 
         return .5*np.sum(term)+ans/self.n
     
     def calc_MAP(self):
@@ -246,6 +242,7 @@ class LogReg(Loss):
         plt.xlabel('Iterations')
         plt.ylabel('$\|x-x_*\|$')
         plt.title('Correctly found minimum with fullgrad Nesterov')
+        plt.savefig('temp.png', format='png')
         return x.squeeze()
     
     def fullgradient(self,q): ## np version
@@ -274,8 +271,8 @@ class GaussianExp(Loss):
         return self.x.mean(dim=0)
     
     def U(self,q):
-        arg=torch.matmul(self.Jchol[None,...], (q-self.truemean[None,...]))
-        ans=torch.sum(arg*arg)
+        arg=np.matmul(self.Jchol[None,...], (q-self.truemean[None,...]))
+        ans=np.sum(arg*arg)
         return .5*ans
     
     def grad(self, q, data):
@@ -377,27 +374,29 @@ def plotter(expname,K):
     # except:
 
     with open(f"LogReg_{expname}HMCtruemean.pkl", 'rb') as f:
-        truemean=pickle.load(f).detach()
+        truemean=pickle.load(f)
+        import torch
+        if isinstance(truemean, torch.Tensor):
+            truemean=truemean.detach().numpy()
     
     n=len(etarange)
     for strat in err.keys():
         loc=sgld_dict[strat]
         for i,timestep in enumerate(loc.keys()):
             samples=loc[timestep]
-            s=samples['samples']
-            e=(s.mean(dim=0)-truemean).mean(dim=0) #shape (n_paths,n_features)
-            e1=(s.mean(dim=1)-truemean)[-10*K:]
-            e1=torch.linalg.norm(e1,dim=1)/torch.linalg.norm(truemean)#shape (n_iters,n_features)
-            h=samples['h']
+            s=samples
+            e=(s.mean(axis=0)-truemean).mean(axis=0) #shape (n_paths,n_features)
+            e1=(s.mean(axis=1)-truemean)[-10*K:]
+            e1=np.linalg.norm(e1, axis=1) / np.linalg.norm(truemean)#shape (n_iters,n_features)
+            h=np.float64(timestep)
             #Plot oscillations
             if i==2:
                 plt.figure(figsize=(3,2))
-                num=round(h.item(),1)
+                num=np.round(h,1)
                 stratlab=strat #'RM' if strat=='1SS' else strat
                 plt.title(f'LogReg {expname}: ' + 'SGLD-'+stratlab+', $h='+f'{num}'+'$')
                 
-                plt.semilogy(np.arange(len(e1))/K,
-                                      torch.abs(e1),'k',ls='-' ,base=2)
+                plt.semilogy(np.arange(len(e1))/K, np.abs(e1),'k',ls='-' ,base=2)
                 plt.xlabel('Iteration over dataset')
                 plt.ylabel('$\|\Delta\mu\|/\|\mu\|$')
                 if strat=='1SS':
@@ -406,7 +405,7 @@ def plotter(expname,K):
                     plt.yticks([2**-1.5,2**-1.4],['$2^{-1.5}$','$2^{-1.4}$'])
 
                 plt.savefig(os.path.join(figdir,f'LogReg{expname}K{K}_Oscillations{strat}.pdf'),format='pdf',bbox_inches='tight')
-            err[strat]+=[torch.linalg.norm(e)/torch.linalg.norm(truemean)]
+            err[strat]+=[np.linalg.norm(e) / np.linalg.norm(truemean)]
 
     with open(f"LogReg_{expname}K{K}_err.pkl", 'wb') as f:
         pickle.dump(err,f)
@@ -426,10 +425,10 @@ def plotter(expname,K):
     plt.xlabel('$h$')
     plt.ylabel('$\|\Delta\mu\|/\|\mu\|$')
     plt.legend()
-    plt.savefig(os.path.join(figdir,f'LogReg{expname}K{K}.pdf'),format='pdf',bbox_inches='tight')
+    plt.savefig(os.path.join(figdir,f'LogReg{expname}K{K}.png'),format='png',bbox_inches='tight')
 
 def runLRExp(expname,K,n_paths=10**4):
-    Nsamples_HMC = 10**7
+    Nsamples_HMC = 10**4
     loss = get_loss(expname, K, n_paths=n_paths, exp='LogReg')
     try:
         with open(f"LogReg_{expname}HMCtruemean.pkl", 'rb') as f:
@@ -437,16 +436,19 @@ def runLRExp(expname,K,n_paths=10**4):
     except:
         print(f'Running HMC sampler to get true mean with {Nsamples_HMC} samples.')
         #HMC to get mean
-        hpV = np.pi/6
+        hpV = np.pi/4
         sampler = Sampler(loss, method='hmc',strat='RM')
+        n_paths_orig = loss.mybatcher.n_paths
+        sampler.loss.mybatcher.n_paths = 1
         samples = getprogress(sampler, hpV, Nsamples_HMC)
-        truemean = samples['samples'].mean(axis=0)
+        sampler.loss.mybatcher.n_paths = n_paths_orig
+        truemean = samples.mean(axis=0)
 
         with open(f"LogReg_{expname}HMCtruemean.pkl", 'wb') as f:
             pickle.dump(truemean,f)
 
-    etarange = 2.**torch.arange(-5,1)
-    Nsamples=torch.tensor(np.minimum(10000+(1000/(etarange.numpy())**2),10**6)).to(torch.int32)
+    etarange = 2.**np.arange(-5,1)
+    Nsamples=np.int64(np.minimum(10000+(1000/(etarange)**2), 10**3))
 
     strats=['RR','RM','FULLGRAD']
     sgld_dict={s:{} for s in strats}
@@ -466,11 +468,11 @@ def runLRExp(expname,K,n_paths=10**4):
 
 #%%
 runLRExp('CTG', 16, 20)
-runLRExp('StatLog', 16, 20)
-runLRExp('Chess', 16, 20)
-runLRExp('SimData', 16, 20)
+# runLRExp('StatLog', 16, 20)
+# runLRExp('Chess', 16, 20)
+# runLRExp('SimData', 16, 20)
 
 plotter('CTG', 16)
-plotter('StatLog', 16)
-plotter('Chess', 16)
-plotter('SimData', 16)
+# plotter('StatLog', 16)
+# plotter('Chess', 16)
+# plotter('SimData', 16)
