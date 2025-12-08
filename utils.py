@@ -176,9 +176,9 @@ class Sampler:
 
     def SGLD(self, q, h): 
         eta = np.random.randn(*q.shape)
-        scaled_eta = np.sqrt(2*h)*solve_triangular(self.loss.Jchol[None,...], eta, lower=False)
+        scaled_eta = np.sqrt(2*h)*solve_triangular(self.loss.Jchol[None,...], eta[...,None], lower=False)
         grad = self.loss.fullgradient(q) if self.strat == 'FG' else self.loss.stochgrad(q)
-        update=cho_solve((self.loss.Jchol[None,...], False), grad)
+        update=cho_solve((self.loss.Jchol[None,...], False), grad[...,None]).squeeze()
         m_q = q - h*update 
         qp = m_q + scaled_eta
 
@@ -202,7 +202,8 @@ class Sampler:
     def HMC(self, q, h): 
         global acc
         h=(1.-0.2*np.random.rand(1))*h
-        v=solve_triangular(self.loss.Jchol[None,...], np.random.randn(*q.shape), lower=False) # Draw v ~ N(0,Jinv)
+        eta = np.random.randn(*q.shape)
+        v=solve_triangular(self.loss.Jchol[None,...], eta[...,None], lower=False).squeeze() # Draw v ~ N(0,Jinv)
         qp = q.copy()
         H0=self.ham(q,v)
         Nsteps = self.HMCsteps
@@ -210,11 +211,11 @@ class Sampler:
         #Do a leg of T//h steps of Strang
         #(b1) Kick
         theta1=h/2
-        v-=theta1*cho_solve((self.loss.Jchol[None, ...], False), self.loss.fullgradient(qp))
+        v-=theta1*cho_solve((self.loss.Jchol[None, ...], False), self.loss.fullgradient(qp)[...,None]).squeeze()
         for t in range(Nsteps):
             qp+=h*v #Drift
             theta = 2*theta1 if (t!=Nsteps-1) else theta1
-            v-=theta*cho_solve((self.loss.Jchol[None,...], False), self.loss.fullgradient(qp))
+            v-=theta*cho_solve((self.loss.Jchol[None,...], False), self.loss.fullgradient(qp)[...,None]).squeeze()
 
         accept=H0-self.ham(qp,v) #acceptance probability
         #Accept/reject
@@ -249,10 +250,10 @@ class LogReg(Loss):
     def grad(self, q, data):
        x,y=data[...,:-1],data[...,-1] #x has shape (n_paths, n, n_features)
        term=q*self.Cinv #q has shape (n_paths, n_features)
-       arg=np.matmul(x,q) #has shape (n_paths, n)
+       arg=np.matmul(x, q[..., None]).squeeze() #has shape (n_paths, n)
        temp=y-npexpit(arg) #has shape (n_paths, n)
        bs=x.shape[1] #self.n divide term/self.mybatcher.K for true splitting scheme
-       temp = np.matmul(x.transpose(0,2,1),temp[...,None]).squeeze() / bs
+       temp = np.matmul(x.transpose((0,2,1)), temp[...,None]).squeeze() / bs
        return term - temp
 
     
