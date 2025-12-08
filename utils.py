@@ -227,10 +227,10 @@ class Sampler:
 class LogReg(Loss):
     def __init__(self, data, K, n_paths, expname):
         n = int(data[0].shape[0])
-        super().__init__(data, K, n_paths, expname, Cinv=1./25./n)
+        super().__init__(data, K, n_paths, expname, Cinv=1./25.)
         self.MAP = self.calc_MAP()
         arg=self.xnew@self.MAP
-        J=self.xnew.T*(npexpit(arg)*npexpit(-arg))@self.xnew / self.n
+        J=self.xnew.T*(npexpit(arg)*npexpit(-arg))@self.xnew
         J += self.Cinv * np.eye(J.shape[0])
         Jchol = cholesky(J, lower=False)
         self.J = J
@@ -245,7 +245,7 @@ class LogReg(Loss):
         ans=-np.sum(self.y*arg) # (n, 1) * (n)
         ans+=np.sum(np.logaddexp(np.zeros_like(arg), arg))
         term=q*self.Cinv*q 
-        return .5*np.sum(term) + ans / self.n
+        return .5*np.sum(term) + ans
     
     def grad(self, q, data):
        x,y=data[...,:-1],data[...,-1] #x has shape (n_paths, n, n_features)
@@ -253,7 +253,7 @@ class LogReg(Loss):
        arg=np.matmul(x, q[..., None]).squeeze() #has shape (n_paths, n)
        temp=y-npexpit(arg) #has shape (n_paths, n)
        bs=x.shape[1] #self.n divide term/self.mybatcher.K for true splitting scheme
-       temp = np.matmul(x.transpose((0,2,1)), temp[...,None]).squeeze() / bs
+       temp = self.n*(np.matmul(x.transpose((0,2,1)), temp[...,None]).squeeze() / bs)
        return term - temp
 
     
@@ -316,7 +316,7 @@ def load_data(expname, datadir='data'):
             xnew=np.hstack((np.ones(shape=(N,1)),x))
             p_i=npexpit((xnew@params))
             y=np.random.binomial(1, p_i).flatten() # output data
-            with open("SimData.pkl", 'wb') as f:
+            with open(datadir+"/SimData.pkl", 'wb') as f:
                 pickle.dump({'x':x,'y':y,'params':params},f)
     elif expname=='SimpleData':
         try:
@@ -351,6 +351,4 @@ def get_HMC(loss, Nsamples_HMC, N_steps=3):
     Sampler.HMCsteps = N_steps
     samples = sampler.run(hpV, Nsamples_HMC)
     truemean = samples.mean(axis=0)
-
-    with open(f"LogReg_{loss.expname}HMCtruemean.pkl", 'wb') as f:
-        pickle.dump(truemean,f)
+    return truemean
