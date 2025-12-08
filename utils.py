@@ -176,7 +176,7 @@ class Sampler:
 
     def SGLD(self, q, h): 
         eta = np.random.randn(*q.shape)
-        scaled_eta = np.sqrt(2*h)*solve_triangular(self.loss.Jchol[None,...], eta[...,None], lower=False)
+        scaled_eta = np.sqrt(2*h)*solve_triangular(self.loss.Jchol[None,...], eta[...,None], lower=False).squeeze()
         grad = self.loss.fullgradient(q) if self.strat == 'FG' else self.loss.stochgrad(q)
         update=cho_solve((self.loss.Jchol[None,...], False), grad[...,None]).squeeze()
         m_q = q - h*update 

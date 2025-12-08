@@ -77,7 +77,7 @@ def plotter(expname,K):
     plt.savefig(os.path.join(figdir,f'LogReg{expname}K{K}.png'),format='png',bbox_inches='tight')
 
 def runLRExp(expname, K, n_paths=10**4):
-    Nsamples_HMC = 10**6
+    Nsamples_HMC = 10**4
 
     x, y = load_data(expname, datadir=datadir)
     try:
@@ -105,6 +105,6 @@ def runLRExp(expname, K, n_paths=10**4):
         pickle.dump(sgld_dict,f)
 
 if __name__ == '__main__':
-    for ename in ['CTG']:
+    for ename in ['StatLog']:
         runLRExp(ename, 16, 20)
         plotter(ename, 16)
